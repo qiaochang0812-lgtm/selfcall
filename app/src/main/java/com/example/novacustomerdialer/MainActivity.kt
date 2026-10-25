@@ -38,6 +38,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
 
 private val callStatuses = listOf("待联系", "已接通", "未接听", "稍后回访", "拒绝", "已成交")
 private val palette = listOf(0xFF2563EB, 0xFF0F9D78, 0xFFF59E0B, 0xFFDB2777, 0xFF7C3AED, 0xFF64748B, 0xFF0891B2, 0xFFDC2626)
@@ -48,7 +49,7 @@ data class Customer(
     val followUp: String = "", val tags: List<String> = emptyList()
 )
 data class CustomerTag(val name: String, val color: Long = palette[0])
-private enum class Page { HOME, CUSTOMERS, DIALER, TAGS }
+private enum class Page { HOME, CUSTOMERS, DIALER, SETTINGS, STATS, TAGS }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -81,6 +82,7 @@ private fun NovaApp() {
     var showTagDialog by remember { mutableStateOf(false) }
     var editingTag by remember { mutableStateOf<CustomerTag?>(null) }
     var showStatusMenu by remember { mutableStateOf(false) }
+    var statsPeriod by remember { mutableStateOf("当天统计") }
 
     fun saveCustomers(value: List<Customer>) { customers = value; persistCustomers(context, value); if (value.none { it.id == currentId }) currentId = value.firstOrNull()?.id; selected = selected.intersect(value.map { it.id }.toSet()) }
     fun saveTags(value: List<CustomerTag>) { tags = value; persistTags(context, value) }
@@ -122,6 +124,13 @@ private fun NovaApp() {
         } catch (e: Exception) { message = "导出失败：${e.message}" }
     }
 
+    val templateLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")) { uri ->
+        if (uri != null) try {
+            context.contentResolver.openOutputStream(uri)?.use { output -> writeBlankCustomerTemplate(output) }
+            message = "Excel 空白模板已保存，可填写后从导入客户中选择。"
+        } catch (e: Exception) { message = "模板生成失败：${e.message}" }
+    }
+
     val current = customers.firstOrNull { it.id == currentId }
     val visible = customers.filter { c ->
         (search.isBlank() || c.name.contains(search, true) || c.phone.contains(search, true) || c.company.contains(search, true)) &&
@@ -143,8 +152,8 @@ private fun NovaApp() {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                     if (page != Page.HOME) TextButton(onClick = { page = Page.HOME }) { Text("‹") }
                     Column(Modifier.weight(1f)) {
-                        Text(when(page) { Page.HOME -> "Nova Dialer"; Page.CUSTOMERS -> "客户管理"; Page.DIALER -> "连续拨号"; Page.TAGS -> "标签管理" }, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                        Text(when(page) { Page.HOME -> "客户跟进工作台"; Page.CUSTOMERS -> "搜索 · 分类 · 批量管理"; Page.DIALER -> "拨打后记录结果，继续下一位"; Page.TAGS -> "按业务需要定义客户分类" }, style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                        Text(when(page) { Page.HOME -> "沟通无限"; Page.CUSTOMERS -> "客户管理"; Page.DIALER -> "连续拨号"; Page.SETTINGS -> "设置"; Page.STATS -> "统计报表"; Page.TAGS -> "标签管理" }, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                        Text(when(page) { Page.HOME -> "高效沟通 · 客户无限"; Page.CUSTOMERS -> "搜索 · 分类 · 批量管理"; Page.DIALER -> "拨打后记录结果，继续下一位"; Page.SETTINGS -> "标签、统计与数据管理"; Page.STATS -> "当天与当月跟进情况"; Page.TAGS -> "按业务需要定义客户分类" }, style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
                     }
                 }
             }
@@ -154,7 +163,8 @@ private fun NovaApp() {
                 NavigationBarItem(selected = page == Page.HOME, onClick = { page = Page.HOME }, icon = { Text("⌂") }, label = { Text("首页") })
                 NavigationBarItem(selected = page == Page.CUSTOMERS, onClick = { page = Page.CUSTOMERS }, icon = { Text("♙") }, label = { Text("客户") })
                 NavigationBarItem(selected = page == Page.DIALER, onClick = { page = Page.DIALER }, icon = { Text("☎") }, label = { Text("拨号") })
-                NavigationBarItem(selected = page == Page.TAGS, onClick = { page = Page.TAGS }, icon = { Text("◆") }, label = { Text("标签") })
+                NavigationBarItem(selected = page == Page.STATS, onClick = { page = Page.STATS }, icon = { Text("▥") }, label = { Text("统计") })
+                NavigationBarItem(selected = page == Page.SETTINGS || page == Page.TAGS, onClick = { page = Page.SETTINGS }, icon = { Text("⚙") }, label = { Text("设置") })
             }
         },
         floatingActionButton = { if (page == Page.CUSTOMERS) FloatingActionButton(onClick = { editing = null; showEditor = true }) { Text("+", style = MaterialTheme.typography.headlineMedium) } }
@@ -162,7 +172,7 @@ private fun NovaApp() {
         when(page) {
             Page.HOME -> HomeScreen(Modifier.padding(insets), customers, message,
                 onCustomers = { page = Page.CUSTOMERS }, onDial = { page = Page.DIALER }, onImport = { importLauncher.launch(arrayOf("text/*", "text/csv", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/octet-stream")) },
-                onExport = { exportLauncher.launch("Nova客户名单.csv") }, onTags = { page = Page.TAGS })
+                onExport = { exportLauncher.launch("沟通无限-客户名单.csv") }, onTags = { page = Page.TAGS }, onSettings = { page = Page.SETTINGS }, onStats = { page = Page.STATS }, onTemplate = { templateLauncher.launch("沟通无限-客户导入空白模板.xlsx") })
             Page.CUSTOMERS -> Column(Modifier.fillMaxSize().padding(insets).padding(horizontal = 14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(search, { search = it }, Modifier.fillMaxWidth(), label = { Text("搜索姓名、电话、单位") }, singleLine = true, shape = RoundedCornerShape(16.dp))
                 Text("客户标签（可多选组合筛选）", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
@@ -176,9 +186,10 @@ private fun NovaApp() {
                     TextButton(onClick = { selected = visible.map { it.id }.toSet() }) { Text("全选") }
                     TextButton(onClick = { selected = emptySet() }) { Text("清除") }
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    OutlinedButton(onClick = { importLauncher.launch(arrayOf("text/*", "text/csv", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/octet-stream")) }, modifier = Modifier.weight(1f)) { Text("导入 Excel/CSV") }
-                    OutlinedButton(onClick = { exportLauncher.launch("Nova客户名单.csv") }, modifier = Modifier.weight(1f)) { Text(if (selected.isEmpty()) "导出全部" else "导出已选(${selected.size})") }
+                Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    OutlinedButton(onClick = { importLauncher.launch(arrayOf("text/*", "text/csv", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/octet-stream")) }, modifier = Modifier.weight(1f)) { Text("导入") }
+                    OutlinedButton(onClick = { templateLauncher.launch("沟通无限-客户导入空白模板.xlsx") }, modifier = Modifier.weight(1f)) { Text("Excel模板") }
+                    OutlinedButton(onClick = { exportLauncher.launch("沟通无限-客户名单.csv") }, modifier = Modifier.weight(1f)) { Text("导出") }
                 }
                 if (selected.isNotEmpty()) Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("已选 ${selected.size} 位", Modifier.weight(1f), color = MaterialTheme.colorScheme.primary)
@@ -212,6 +223,47 @@ private fun NovaApp() {
                     OutlinedButton(onClick = { editing = current; showEditor = true }, Modifier.fillMaxWidth()) { Text("编辑当前客户") }
                 }
                 Text(message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+            }
+            Page.SETTINGS -> Column(Modifier.fillMaxSize().padding(insets).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Card(shape = RoundedCornerShape(22.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF0FF))) {
+                    Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("沟通无限", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Color(0xFF245BDB))
+                        Text("客户跟进与高效拨号工具", color = Color(0xFF475569))
+                    }
+                }
+                HomeAction("统计报表", "查看当天统计与当月统计", "▥", { page = Page.STATS })
+                HomeAction("标签管理", "创建自定义标签并设置颜色", "◆", { page = Page.TAGS })
+                HomeAction("导入客户", "导入 Excel (.xlsx) 或 CSV", "↓", { importLauncher.launch(arrayOf("text/*", "text/csv", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/octet-stream")) })
+                HomeAction("Excel 空白模板", "下载后填写姓名、电话、单位和备注", "▤", { templateLauncher.launch("沟通无限-客户导入空白模板.xlsx") })
+                HomeAction("导出客户", "将全部客户导出为 CSV（Excel 可打开）", "↑", { exportLauncher.launch("沟通无限-客户名单.csv") })
+                Text("客户数据保存在本机。建议定期导出备份。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+            }
+            Page.STATS -> {
+                val today = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+                val month = SimpleDateFormat("yyyy-MM", Locale.getDefault()).format(Date())
+                val periodPrefix = if (statsPeriod == "当天统计") today else month
+                val touched = customers.filter { c -> c.note.lines().any { line -> line.trim().startsWith(periodPrefix) } }
+                val statusCount = callStatuses.filter { it != "待联系" }.associateWith { status -> touched.count { it.status == status } }
+                Column(Modifier.fillMaxSize().padding(insets).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(selected = statsPeriod == "当天统计", onClick = { statsPeriod = "当天统计" }, label = { Text("当天统计") }, modifier = Modifier.weight(1f))
+                        FilterChip(selected = statsPeriod == "当月统计", onClick = { statsPeriod = "当月统计" }, label = { Text("当月统计") }, modifier = Modifier.weight(1f))
+                    }
+                    Text(if (statsPeriod == "当天统计") today else month, color = Color(0xFF64748B))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        MetricCard("有沟通记录客户", touched.size.toString(), Modifier.weight(1f))
+                        MetricCard("已接通", (statusCount["已接通"] ?: 0).toString(), Modifier.weight(1f))
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        MetricCard("未接听", (statusCount["未接听"] ?: 0).toString(), Modifier.weight(1f))
+                        MetricCard("稍后回访", (statusCount["稍后回访"] ?: 0).toString(), Modifier.weight(1f))
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        MetricCard("拒绝", (statusCount["拒绝"] ?: 0).toString(), Modifier.weight(1f))
+                        MetricCard("已成交", (statusCount["已成交"] ?: 0).toString(), Modifier.weight(1f))
+                    }
+                    Text("统计说明：根据客户备注中自动追加的日期时间记录筛选；状态按客户当前状态统计，不等同于完整历史通话次数。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                }
             }
             Page.TAGS -> Column(Modifier.fillMaxSize().padding(insets).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text("自定义标签", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
@@ -255,7 +307,7 @@ private fun NovaApp() {
     })
 }
 
-@Composable private fun HomeScreen(modifier: Modifier, customers: List<Customer>, message: String, onCustomers: () -> Unit, onDial: () -> Unit, onImport: () -> Unit, onExport: () -> Unit, onTags: () -> Unit) {
+@Composable private fun HomeScreen(modifier: Modifier, customers: List<Customer>, message: String, onCustomers: () -> Unit, onDial: () -> Unit, onImport: () -> Unit, onExport: () -> Unit, onTags: () -> Unit, onSettings: () -> Unit, onStats: () -> Unit, onTemplate: () -> Unit) {
     Column(modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Card(shape = RoundedCornerShape(26.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFF245BDB))) { Column(Modifier.fillMaxWidth().padding(22.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("让每一次跟进都有记录", color = Color.White, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
@@ -267,7 +319,11 @@ private fun NovaApp() {
         Text("功能模块", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         HomeAction("客户管理系统", "客户列表、标签分类、编辑与批量操作", "▦", onCustomers)
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) { HomeAction("导入名单", "Excel / CSV", "↓", onImport, Modifier.weight(1f)); HomeAction("导出名单", "CSV / Excel 可打开", "↑", onExport, Modifier.weight(1f)) }
-        HomeAction("自定义标签", "创建分类并设置颜色", "◆", onTags)
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            HomeAction("统计报表", "当天 / 当月", "▥", onStats, Modifier.weight(1f))
+            HomeAction("设置", "标签与数据管理", "⚙", onSettings, Modifier.weight(1f))
+        }
+        HomeAction("Excel 空白模板", "下载填写后即可导入", "▤", onTemplate)
         Text(message, style = MaterialTheme.typography.bodySmall, color = Color(0xFF245BDB))
     }
 }
@@ -318,6 +374,17 @@ private fun NovaApp() {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { palette.forEach { p -> Box(Modifier.size(30.dp).background(Color(p), RoundedCornerShape(50)).clickable { color = p }, contentAlignment = Alignment.Center) { if (color == p) Text("✓", color = Color.White) } } }
         if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error)
     } }, confirmButton = { Button(onClick = { if (name.isBlank()) error = "请输入标签名称。" else onSave(CustomerTag(name.trim(), color)) }) { Text("保存") } }, dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } })
+}
+
+private fun writeBlankCustomerTemplate(output: java.io.OutputStream) {
+    val files = linkedMapOf(
+        "[Content_Types].xml" to """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>""",
+        "_rels/.rels" to """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>""",
+        "xl/workbook.xml" to """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="客户导入模板" sheetId="1" r:id="rId1"/></sheets></workbook>""",
+        "xl/_rels/workbook.xml.rels" to """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>""",
+        "xl/worksheets/sheet1.xml" to """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetFormatPr defaultRowHeight="20"/><cols><col min="1" max="1" width="18" customWidth="1"/><col min="2" max="2" width="20" customWidth="1"/><col min="3" max="3" width="28" customWidth="1"/><col min="4" max="4" width="36" customWidth="1"/></cols><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>姓名</t></is></c><c r="B1" t="inlineStr"><is><t>电话</t></is></c><c r="C1" t="inlineStr"><is><t>单位名称</t></is></c><c r="D1" t="inlineStr"><is><t>备注情况</t></is></c></row></sheetData><autoFilter ref="A1:D1"/></worksheet>"""
+    )
+    ZipOutputStream(output).use { zip -> files.forEach { (name, content) -> zip.putNextEntry(java.util.zip.ZipEntry(name)); zip.write(content.toByteArray(Charsets.UTF_8)); zip.closeEntry() } }
 }
 
 private fun loadCustomers(context: Context): List<Customer> = try {
