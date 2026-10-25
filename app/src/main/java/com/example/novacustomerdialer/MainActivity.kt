@@ -1,6 +1,7 @@
 package com.example.novacustomerdialer
 
 import android.content.Context
+import android.app.DatePickerDialog
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -52,6 +53,7 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.Calendar
 import java.util.Locale
 import java.util.UUID
 import java.util.zip.ZipInputStream
@@ -85,6 +87,7 @@ private fun NovaApp() {
     var search by remember { mutableStateOf("") }
     var statusFilter by remember { mutableStateOf("全部状态") }
     var dialerStatusFilter by remember { mutableStateOf("全部状态") }
+    var dialerQuickFilter by remember { mutableStateOf("全部名单") }
     var selectedTags by remember { mutableStateOf(setOf<String>()) }
     var selected by remember { mutableStateOf(setOf<String>()) }
     var editing by remember { mutableStateOf<Customer?>(null) }
@@ -141,8 +144,15 @@ private fun NovaApp() {
         } catch (e: Exception) { message = "导出失败：${e.message}" }
     }
 
+    val todayForDialer = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
     val current = customers.firstOrNull { it.id == currentId }
-    val dialerCustomers = customers.filter { dialerStatusFilter == "全部状态" || it.status == dialerStatusFilter }
+    val dialerCustomers = customers.filter { c ->
+        (dialerStatusFilter == "全部状态" || c.status == dialerStatusFilter) && when (dialerQuickFilter) {
+            "到期回访" -> c.followUp.trim().take(10).let { it.isNotBlank() && it <= todayForDialer }
+            "稍后回访" -> c.status == "稍后回访"
+            else -> true
+        }
+    }
     val visible = customers.filter { c ->
         (search.isBlank() || c.name.contains(search, true) || c.phone.contains(search, true) || c.company.contains(search, true)) &&
         (statusFilter == "全部状态" || c.status == statusFilter) && (selectedTags.isEmpty() || selectedTags.all { it in c.tags })
@@ -181,7 +191,21 @@ private fun NovaApp() {
         floatingActionButton = { if (page == Page.CUSTOMERS) FloatingActionButton(onClick = { editing = null; showEditor = true }) { Text("+", style = MaterialTheme.typography.headlineMedium) } }
     ) { insets ->
         when(page) {
-            Page.HOME -> HomeScreen(Modifier.padding(insets), customers, onDial = { page = Page.DIALER }, onCustomers = { page = Page.CUSTOMERS })
+            Page.HOME -> HomeScreen(
+                Modifier.padding(insets), customers,
+                onDial = { dialerQuickFilter = "全部名单"; dialerStatusFilter = "全部状态"; page = Page.DIALER },
+                onCustomers = { page = Page.CUSTOMERS },
+                onDueFollowUps = {
+                    dialerQuickFilter = "到期回访"; dialerStatusFilter = "全部状态";
+                    currentId = customers.firstOrNull { it.followUp.trim().take(10).let { d -> d.isNotBlank() && d <= todayForDialer } }?.id ?: currentId
+                    page = Page.DIALER
+                },
+                onLaterFollowUps = {
+                    dialerQuickFilter = "稍后回访"; dialerStatusFilter = "全部状态";
+                    currentId = customers.firstOrNull { it.status == "稍后回访" }?.id ?: currentId
+                    page = Page.DIALER
+                }
+            )
             Page.CUSTOMERS -> Column(Modifier.fillMaxSize().padding(insets).padding(horizontal = 14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(search, { search = it }, Modifier.fillMaxWidth(), label = { Text("搜索姓名、电话、单位") }, singleLine = true, shape = RoundedCornerShape(16.dp))
                 Text("客户标签（可多选组合筛选）", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
@@ -214,12 +238,12 @@ private fun NovaApp() {
                     Box {
                         OutlinedButton(onClick = { showStatusMenu = true }) { Text(dialerStatusFilter) }
                         DropdownMenu(expanded = showStatusMenu, onDismissRequest = { showStatusMenu = false }) {
-                            (listOf("全部状态") + callStatuses).forEach { status -> DropdownMenuItem(text = { Text(status) }, onClick = { dialerStatusFilter = status; showStatusMenu = false; val first = customers.firstOrNull { status == "全部状态" || it.status == status }; if (first != null && customers.filter { status == "全部状态" || it.status == status }.none { it.id == currentId }) currentId = first.id }) }
+                            (listOf("全部状态") + callStatuses).forEach { status -> DropdownMenuItem(text = { Text(status) }, onClick = { dialerStatusFilter = status; dialerQuickFilter = "全部名单"; showStatusMenu = false; val first = customers.firstOrNull { status == "全部状态" || it.status == status }; if (first != null && customers.filter { status == "全部状态" || it.status == status }.none { it.id == currentId }) currentId = first.id }) }
                         }
                     }
                 }
-                Text("按沟通状态筛选拨号名单 · ${dialerCustomers.size} 位客户", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
-                if (current != null && (dialerStatusFilter == "全部状态" || current.status == dialerStatusFilter)) {
+                Text("${if (dialerQuickFilter == "全部名单") "按沟通状态筛选拨号名单" else dialerQuickFilter + "名单"} · ${dialerCustomers.size} 位客户", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                if (current != null && dialerCustomers.any { it.id == current.id }) {
                     Card(shape = RoundedCornerShape(22.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF0FF))) {
                         Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
                             Text("当前客户", color = Color(0xFF245BDB), style = MaterialTheme.typography.labelLarge)
@@ -343,7 +367,9 @@ private fun HomeScreen(
     modifier: Modifier,
     customers: List<Customer>,
     onDial: () -> Unit,
-    onCustomers: () -> Unit
+    onCustomers: () -> Unit,
+    onDueFollowUps: () -> Unit,
+    onLaterFollowUps: () -> Unit
 ) {
     val today = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
     val dueFollowUps = customers.count { c -> c.followUp.trim().take(10).let { it.isNotBlank() && it <= today } }
@@ -367,12 +393,12 @@ private fun HomeScreen(
                     }
                     Text("今日待办", color = Color(0xFFE0E9FF), style = MaterialTheme.typography.titleMedium)
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Column(Modifier.weight(1f).background(Color.White.copy(alpha = 0.13f), RoundedCornerShape(16.dp)).padding(14.dp)) {
+                        Column(Modifier.weight(1f).background(Color.White.copy(alpha = 0.13f), RoundedCornerShape(16.dp)).clickable(onClick = onDueFollowUps).padding(14.dp)) {
                             Text("到期回访", color = Color(0xFFE0E9FF), style = MaterialTheme.typography.labelLarge)
                             Text("$dueFollowUps", color = Color.White, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
                             Text("位客户", color = Color(0xFFE0E9FF), style = MaterialTheme.typography.bodySmall)
                         }
-                        Column(Modifier.weight(1f).background(Color.White.copy(alpha = 0.13f), RoundedCornerShape(16.dp)).padding(14.dp)) {
+                        Column(Modifier.weight(1f).background(Color.White.copy(alpha = 0.13f), RoundedCornerShape(16.dp)).clickable(onClick = onLaterFollowUps).padding(14.dp)) {
                             Text("稍后回访", color = Color(0xFFE0E9FF), style = MaterialTheme.typography.labelLarge)
                             Text("$laterFollowUps", color = Color.White, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
                             Text("位客户", color = Color(0xFFE0E9FF), style = MaterialTheme.typography.bodySmall)
@@ -428,13 +454,35 @@ private fun HomeScreen(
 @Composable private fun EmptyCard(title: String, subtitle: String) { Card(shape = RoundedCornerShape(18.dp)) { Column(Modifier.fillMaxWidth().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) { Text(title, fontWeight = FontWeight.Bold); Text(subtitle, color = Color(0xFF64748B)) } } }
 
 @Composable private fun CustomerEditor(initial: Customer?, tags: List<CustomerTag>, onDismiss: () -> Unit, onSave: (Customer) -> Unit, onDelete: (Customer) -> Unit, onCreateTag: (String) -> Unit) {
+    val context = LocalContext.current
     var name by remember(initial?.id) { mutableStateOf(initial?.name.orEmpty()) }; var phone by remember(initial?.id) { mutableStateOf(initial?.phone.orEmpty()) }; var company by remember(initial?.id) { mutableStateOf(initial?.company.orEmpty()) }; var note by remember(initial?.id) { mutableStateOf(initial?.note.orEmpty()) }; var status by remember(initial?.id) { mutableStateOf(initial?.status ?: "待联系") }; var followUp by remember(initial?.id) { mutableStateOf(initial?.followUp.orEmpty()) }; var chosen by remember(initial?.id) { mutableStateOf(initial?.tags?.toSet() ?: emptySet()) }; var error by remember { mutableStateOf("") }; var statusMenu by remember { mutableStateOf(false) }; var newTag by remember { mutableStateOf("") }
     AlertDialog(onDismissRequest = onDismiss, title = { Text(if (initial == null) "新增客户" else "编辑客户") }, text = { Column(Modifier.heightIn(max = 540.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
         OutlinedTextField(name, { name = it }, label = { Text("姓名 *") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
         OutlinedTextField(phone, { phone = it }, label = { Text("电话 *") }, modifier = Modifier.fillMaxWidth(), singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone))
         OutlinedTextField(company, { company = it }, label = { Text("单位名称") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
         Box { OutlinedButton(onClick = { statusMenu = true }, modifier = Modifier.fillMaxWidth()) { Text("沟通状态：$status") }; DropdownMenu(expanded = statusMenu, onDismissRequest = { statusMenu = false }) { callStatuses.forEach { s -> DropdownMenuItem(text = { Text(s) }, onClick = { status = s; statusMenu = false }) } } }
-        OutlinedTextField(followUp, { followUp = it }, label = { Text("下次回访日期") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(
+                value = followUp,
+                onValueChange = {},
+                readOnly = true,
+                label = { Text("下次回访日期") },
+                placeholder = { Text("选择回访日期") },
+                modifier = Modifier.weight(1f),
+                singleLine = true
+            )
+            OutlinedButton(onClick = {
+                val calendar = Calendar.getInstance()
+                val parsed = try { if (followUp.isNotBlank()) SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).parse(followUp.take(10)) else null } catch (_: Exception) { null }
+                if (parsed != null) calendar.time = parsed else calendar.add(Calendar.DAY_OF_YEAR, 1)
+                DatePickerDialog(
+                    context,
+                    { _, year, month, day -> followUp = String.format(Locale.ROOT, "%04d-%02d-%02d", year, month + 1, day) },
+                    calendar.get(Calendar.YEAR), calendar.get(Calendar.MONTH), calendar.get(Calendar.DAY_OF_MONTH)
+                ).show()
+            }) { Text("选日期") }
+        }
+        Text("打开日期选择器时，默认选中明天；也可以改选其他日期。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
         OutlinedTextField(note, { note = it }, label = { Text("备注 / 沟通情况") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
         Text("客户标签（可多选）", fontWeight = FontWeight.SemiBold)
         tags.forEach { t -> FilterChip(selected = t.name in chosen, onClick = { chosen = if (t.name in chosen) chosen - t.name else chosen + t.name }, label = { Text(t.name) }, leadingIcon = { Box(Modifier.size(9.dp).background(Color(t.color), RoundedCornerShape(50))) }) }
