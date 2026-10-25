@@ -62,7 +62,7 @@ private val palette = listOf(0xFF2563EB, 0xFF0F9D78, 0xFFF59E0B, 0xFFDB2777, 0xF
 data class Customer(
     val id: String = UUID.randomUUID().toString(), val name: String, val phone: String,
     val company: String = "", val note: String = "", val status: String = "待联系",
-    val followUp: String = "", val tags: List<String> = emptyList()
+    val followUp: String = "", val tags: List<String> = emptyList(), val lastContactAt: String = ""
 )
 data class CustomerTag(val name: String, val color: Long = palette[0])
 private enum class Page { HOME, CUSTOMERS, DIALER, SETTINGS, STATS, TAGS }
@@ -84,6 +84,7 @@ private fun NovaApp() {
     var currentId by remember { mutableStateOf(customers.firstOrNull()?.id) }
     var search by remember { mutableStateOf("") }
     var statusFilter by remember { mutableStateOf("全部状态") }
+    var dialerStatusFilter by remember { mutableStateOf("全部状态") }
     var selectedTags by remember { mutableStateOf(setOf<String>()) }
     var selected by remember { mutableStateOf(setOf<String>()) }
     var editing by remember { mutableStateOf<Customer?>(null) }
@@ -141,6 +142,7 @@ private fun NovaApp() {
     }
 
     val current = customers.firstOrNull { it.id == currentId }
+    val dialerCustomers = customers.filter { dialerStatusFilter == "全部状态" || it.status == dialerStatusFilter }
     val visible = customers.filter { c ->
         (search.isBlank() || c.name.contains(search, true) || c.phone.contains(search, true) || c.company.contains(search, true)) &&
         (statusFilter == "全部状态" || c.status == statusFilter) && (selectedTags.isEmpty() || selectedTags.all { it in c.tags })
@@ -149,7 +151,7 @@ private fun NovaApp() {
         val c = current ?: return
         val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date())
         val appended = if (outcomeNote.isBlank()) c.note else listOf(c.note, "$stamp：${outcomeNote.trim()}").filter { it.isNotBlank() }.joinToString("\n")
-        saveCustomers(customers.map { if (it.id == c.id) it.copy(status = outcome, note = appended, followUp = outcomeDate.trim()) else it })
+        saveCustomers(customers.map { if (it.id == c.id) it.copy(status = outcome, note = appended, followUp = outcomeDate.trim(), lastContactAt = stamp) else it })
         val idx = customers.indexOfFirst { it.id == c.id }
         if (goNext) { val next = customers.drop(idx + 1).firstOrNull { it.id != c.id }; if (next != null) currentId = next.id else message = "记录已保存，当前已是最后一位。" }
         showOutcome = false; pendingCall = null; message = if (goNext && idx < customers.lastIndex) "记录已保存，已切换下一位。" else "沟通记录已保存。"
@@ -179,9 +181,7 @@ private fun NovaApp() {
         floatingActionButton = { if (page == Page.CUSTOMERS) FloatingActionButton(onClick = { editing = null; showEditor = true }) { Text("+", style = MaterialTheme.typography.headlineMedium) } }
     ) { insets ->
         when(page) {
-            Page.HOME -> HomeScreen(Modifier.padding(insets), customers,
-                onOpenCustomer = { customer -> currentId = customer.id; page = Page.DIALER },
-                onDial = { page = Page.DIALER }, onCustomers = { page = Page.CUSTOMERS })
+            Page.HOME -> HomeScreen(Modifier.padding(insets), customers, onDial = { page = Page.DIALER }, onCustomers = { page = Page.CUSTOMERS })
             Page.CUSTOMERS -> Column(Modifier.fillMaxSize().padding(insets).padding(horizontal = 14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(search, { search = it }, Modifier.fillMaxWidth(), label = { Text("搜索姓名、电话、单位") }, singleLine = true, shape = RoundedCornerShape(16.dp))
                 Text("客户标签（可多选组合筛选）", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
@@ -208,27 +208,51 @@ private fun NovaApp() {
                     items(visible, key = { it.id }) { c -> CustomerCard(c, tags, c.id in selected, onSelect = { yes -> selected = if (yes) selected + c.id else selected - c.id }, onOpen = { currentId = c.id; page = Page.DIALER }, onEdit = { editing = c; showEditor = true }) }
                 }
             }
-            Page.DIALER -> Column(Modifier.fillMaxSize().padding(insets).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                if (current == null) EmptyCard("还没有客户", "先进入客户管理页面新增客户或导入名单。") else {
-                    Card(shape = RoundedCornerShape(26.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF0FF))) {
-                        Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                            Text("当前客户", color = Color(0xFF245BDB), style = MaterialTheme.typography.labelLarge)
-                            Text(current.name, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
-                            Text(current.phone, style = MaterialTheme.typography.titleLarge)
-                            if (current.company.isNotBlank()) Text(current.company, color = Color(0xFF475569))
-                            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) { current.tags.forEach { t -> val def = tags.firstOrNull { it.name == t }; AssistChip(onClick = {}, label = { Text(t) }, leadingIcon = { Box(Modifier.size(8.dp).background(Color(def?.color ?: palette[0]), RoundedCornerShape(50))) }) } }
-                            Text("状态：${current.status}")
-                            if (current.note.isNotBlank()) Text("最近备注：${current.note.takeLast(150)}", maxLines = 3)
-                            Button(onClick = { pendingCall = current.id; try { context.startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(current.phone)}"))) } catch (_: Exception) { pendingCall = null; message = "无法打开系统拨号界面。" } }, Modifier.fillMaxWidth().height(54.dp), shape = RoundedCornerShape(16.dp)) { Text("☎  拨打当前客户", style = MaterialTheme.typography.titleMedium) }
-                            Text("拨号界面退出并返回本应用后，会弹出快速记录窗口。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF475569))
+            Page.DIALER -> Column(Modifier.fillMaxSize().padding(insets).padding(horizontal = 14.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("拨号名单", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    Box {
+                        OutlinedButton(onClick = { showStatusMenu = true }) { Text(dialerStatusFilter) }
+                        DropdownMenu(expanded = showStatusMenu, onDismissRequest = { showStatusMenu = false }) {
+                            (listOf("全部状态") + callStatuses).forEach { status -> DropdownMenuItem(text = { Text(status) }, onClick = { dialerStatusFilter = status; showStatusMenu = false; val first = customers.firstOrNull { status == "全部状态" || it.status == status }; if (first != null && customers.filter { status == "全部状态" || it.status == status }.none { it.id == currentId }) currentId = first.id }) }
                         }
                     }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick = { val i = customers.indexOfFirst { it.id == current.id }; if (i > 0) currentId = customers[i-1].id }, enabled = customers.indexOfFirst { it.id == current.id } > 0, modifier = Modifier.weight(1f)) { Text("上一位") }
-                        Button(onClick = { outcome = current.status.takeIf { it != "待联系" } ?: "已接通"; outcomeNote = ""; outcomeDate = current.followUp; showOutcome = true }, modifier = Modifier.weight(1.2f)) { Text("记录结果") }
-                        Button(onClick = { val i = customers.indexOfFirst { it.id == current.id }; customers.getOrNull(i+1)?.let { currentId = it.id } ?: run { message = "已到名单末尾。" } }, modifier = Modifier.weight(1f)) { Text("下一位") }
+                }
+                Text("按沟通状态筛选拨号名单 · ${dialerCustomers.size} 位客户", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                if (current != null && (dialerStatusFilter == "全部状态" || current.status == dialerStatusFilter)) {
+                    Card(shape = RoundedCornerShape(22.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF0FF))) {
+                        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                            Text("当前客户", color = Color(0xFF245BDB), style = MaterialTheme.typography.labelLarge)
+                            Text(current.name, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                            Text(current.phone, style = MaterialTheme.typography.titleMedium)
+                            if (current.company.isNotBlank()) Text(current.company, color = Color(0xFF475569))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                SuggestionChip(onClick = {}, label = { Text("状态：${current.status}") })
+                                Text("最后沟通：${lastCommunication(current)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF475569))
+                            }
+                            Button(onClick = { pendingCall = current.id; try { context.startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(current.phone)}"))) } catch (_: Exception) { pendingCall = null; message = "无法打开系统拨号界面。" } }, Modifier.fillMaxWidth().height(50.dp), shape = RoundedCornerShape(15.dp)) { Text("拨打当前客户") }
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(onClick = { val i = dialerCustomers.indexOfFirst { it.id == current.id }; if (i > 0) currentId = dialerCustomers[i - 1].id }, enabled = dialerCustomers.indexOfFirst { it.id == current.id } > 0, modifier = Modifier.weight(1f)) { Text("上一位") }
+                                Button(onClick = { outcome = current.status.takeIf { it != "待联系" } ?: "已接通"; outcomeNote = ""; outcomeDate = current.followUp; showOutcome = true }, modifier = Modifier.weight(1.2f)) { Text("记录结果") }
+                                OutlinedButton(onClick = { val i = dialerCustomers.indexOfFirst { it.id == current.id }; dialerCustomers.getOrNull(i + 1)?.let { currentId = it.id } ?: run { message = "当前筛选名单已到末尾。" } }, enabled = dialerCustomers.indexOfFirst { it.id == current.id } >= 0 && dialerCustomers.indexOfFirst { it.id == current.id } < dialerCustomers.lastIndex, modifier = Modifier.weight(1f)) { Text("下一位") }
+                            }
+                        }
                     }
-                    OutlinedButton(onClick = { editing = current; showEditor = true }, Modifier.fillMaxWidth()) { Text("编辑当前客户") }
+                } else EmptyCard("没有符合状态的客户", "请选择其他沟通状态，或先到客户管理中添加客户。")
+                Text("选择名单中的客户", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(7.dp), contentPadding = PaddingValues(bottom = 8.dp)) {
+                    items(dialerCustomers, key = { it.id }) { c ->
+                        Card(modifier = Modifier.fillMaxWidth().clickable { currentId = c.id }, shape = RoundedCornerShape(15.dp), colors = CardDefaults.cardColors(containerColor = if (c.id == currentId) Color(0xFFEAF0FF) else Color.White)) {
+                            Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                    Text(c.name, fontWeight = FontWeight.SemiBold)
+                                    Text("${c.phone}${if (c.company.isNotBlank()) " · ${c.company}" else ""}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF475569), maxLines = 1)
+                                    Text("最后沟通：${lastCommunication(c)}", style = MaterialTheme.typography.labelSmall, color = Color(0xFF64748B))
+                                }
+                                SuggestionChip(onClick = { currentId = c.id }, label = { Text(c.status) })
+                            }
+                        }
+                    }
                 }
                 Text(message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
             }
@@ -318,28 +342,20 @@ private fun NovaApp() {
 private fun HomeScreen(
     modifier: Modifier,
     customers: List<Customer>,
-    onOpenCustomer: (Customer) -> Unit,
     onDial: () -> Unit,
     onCustomers: () -> Unit
 ) {
     val today = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
-    val todos = customers.filter { c ->
-        c.followUp.trim().startsWith(today) || c.status == "待联系" || c.status == "稍后回访"
-    }.sortedWith(compareBy<Customer> { if (it.followUp.trim().startsWith(today)) 0 else 1 }.thenBy { it.name })
+    val dueFollowUps = customers.count { c -> c.followUp.trim().take(10).let { it.isNotBlank() && it <= today } }
+    val laterFollowUps = customers.count { it.status == "稍后回访" }
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         item {
-            Card(
-                shape = RoundedCornerShape(26.dp),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF245BDB))
-            ) {
-                Column(
-                    Modifier.fillMaxWidth().padding(22.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
+            Card(shape = RoundedCornerShape(26.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFF245BDB))) {
+                Column(Modifier.fillMaxWidth().padding(22.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         Box(Modifier.size(44.dp).background(Color.White.copy(alpha = 0.18f), RoundedCornerShape(14.dp)), contentAlignment = Alignment.Center) {
                             Icon(Icons.Filled.PhoneInTalk, contentDescription = null, tint = Color.White, modifier = Modifier.size(26.dp))
@@ -349,81 +365,35 @@ private fun HomeScreen(
                             Text("高效跟进，让每次沟通都有价值", color = Color(0xFFE0E9FF), style = MaterialTheme.typography.bodySmall)
                         }
                     }
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text("今日待办", color = Color(0xFFE0E9FF), style = MaterialTheme.typography.labelLarge)
-                            Text("${todos.size} 位客户", color = Color.White, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                    Text("今日待办", color = Color(0xFFE0E9FF), style = MaterialTheme.typography.titleMedium)
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Column(Modifier.weight(1f).background(Color.White.copy(alpha = 0.13f), RoundedCornerShape(16.dp)).padding(14.dp)) {
+                            Text("到期回访", color = Color(0xFFE0E9FF), style = MaterialTheme.typography.labelLarge)
+                            Text("$dueFollowUps", color = Color.White, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
+                            Text("位客户", color = Color(0xFFE0E9FF), style = MaterialTheme.typography.bodySmall)
                         }
-                        Button(
-                            onClick = onDial,
-                            colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color(0xFF245BDB)),
-                            shape = RoundedCornerShape(14.dp)
-                        ) { Icon(Icons.Filled.Call, contentDescription = null); Spacer(Modifier.width(6.dp)); Text("开始拨号") }
+                        Column(Modifier.weight(1f).background(Color.White.copy(alpha = 0.13f), RoundedCornerShape(16.dp)).padding(14.dp)) {
+                            Text("稍后回访", color = Color(0xFFE0E9FF), style = MaterialTheme.typography.labelLarge)
+                            Text("$laterFollowUps", color = Color.White, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
+                            Text("位客户", color = Color(0xFFE0E9FF), style = MaterialTheme.typography.bodySmall)
+                        }
                     }
                 }
             }
         }
         item {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    MetricCard("客户总数", customers.size.toString(), Modifier.weight(1f))
-                    MetricCard("待联系", customers.count { it.status == "待联系" }.toString(), Modifier.weight(1f))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Button(onClick = onDial, modifier = Modifier.weight(1f).height(54.dp), shape = RoundedCornerShape(16.dp)) {
+                    Icon(Icons.Filled.Call, contentDescription = null); Spacer(Modifier.width(6.dp)); Text("开始拨号")
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    MetricCard("待回访", customers.count { it.status == "稍后回访" }.toString(), Modifier.weight(1f))
-                    MetricCard("已成交", customers.count { it.status == "已成交" }.toString(), Modifier.weight(1f))
+                OutlinedButton(onClick = onCustomers, modifier = Modifier.weight(1f).height(54.dp), shape = RoundedCornerShape(16.dp)) {
+                    Icon(Icons.Filled.People, contentDescription = null); Spacer(Modifier.width(6.dp)); Text("客户管理")
                 }
             }
         }
         item {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Filled.EventNote, contentDescription = null, tint = Color(0xFF245BDB))
-                Spacer(Modifier.width(8.dp))
-                Column(Modifier.weight(1f)) {
-                    Text("今日待办", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    Text("${today} · 待联系及到期回访客户", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
-                }
-                TextButton(onClick = onCustomers) { Text("全部客户"); Icon(Icons.Filled.ChevronRight, contentDescription = null) }
-            }
+            Text("只显示待办数量，不展示具体客户信息。进入拨号页面后，可按沟通状态筛选名单。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
         }
-        if (todos.isEmpty()) {
-            item {
-                Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
-                    Column(Modifier.fillMaxWidth().padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Icon(Icons.Filled.CheckCircle, contentDescription = null, tint = Color(0xFF0F9D78), modifier = Modifier.size(38.dp))
-                        Text("今天暂时没有待办", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                        Text("新增客户或设置回访日期后，会显示在这里。", color = Color(0xFF64748B), style = MaterialTheme.typography.bodySmall)
-                        OutlinedButton(onClick = onCustomers) { Text("进入客户管理") }
-                    }
-                }
-            }
-        } else {
-            items(todos, key = { it.id }) { c ->
-                Card(
-                    modifier = Modifier.fillMaxWidth().clickable { onOpenCustomer(c) },
-                    shape = RoundedCornerShape(20.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color.White),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
-                ) {
-                    Row(Modifier.fillMaxWidth().padding(15.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Box(Modifier.size(44.dp).background(Color(0xFFEAF0FF), RoundedCornerShape(15.dp)), contentAlignment = Alignment.Center) {
-                            Icon(if (c.followUp.trim().startsWith(today)) Icons.Filled.Schedule else Icons.Filled.RadioButtonUnchecked, contentDescription = null, tint = Color(0xFF245BDB))
-                        }
-                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                            Text(c.name, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
-                            Text(c.phone, color = Color(0xFF475569), style = MaterialTheme.typography.bodyMedium)
-                            if (c.company.isNotBlank()) Text(c.company, color = Color(0xFF64748B), style = MaterialTheme.typography.bodySmall, maxLines = 1)
-                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                                SuggestionChip(onClick = { onOpenCustomer(c) }, label = { Text(c.status) })
-                                if (c.followUp.isNotBlank()) Text("回访：${c.followUp}", color = Color(0xFF64748B), style = MaterialTheme.typography.labelSmall)
-                            }
-                        }
-                        IconButton(onClick = { onOpenCustomer(c) }) { Icon(Icons.Filled.Call, contentDescription = "记录或拨打", tint = Color(0xFF0F9D78)) }
-                    }
-                }
-            }
-        }
-        item { Spacer(Modifier.height(8.dp)) }
     }
 }
 
@@ -485,11 +455,16 @@ private fun HomeScreen(
 
 private fun loadCustomers(context: Context): List<Customer> = try {
     val a = JSONArray(context.getSharedPreferences("nova_customers", Context.MODE_PRIVATE).getString("data", "[]") ?: "[]")
-    (0 until a.length()).map { i -> val o = a.getJSONObject(i); Customer(o.optString("id", UUID.randomUUID().toString()), o.optString("name"), o.optString("phone"), o.optString("company"), o.optString("note"), o.optString("status", "待联系"), o.optString("followUp"), o.optJSONArray("tags")?.let { ar -> (0 until ar.length()).map { ar.optString(it) } } ?: emptyList()) }.filter { it.name.isNotBlank() && it.phone.isNotBlank() }
+    (0 until a.length()).map { i -> val o = a.getJSONObject(i); Customer(o.optString("id", UUID.randomUUID().toString()), o.optString("name"), o.optString("phone"), o.optString("company"), o.optString("note"), o.optString("status", "待联系"), o.optString("followUp"), o.optJSONArray("tags")?.let { ar -> (0 until ar.length()).map { ar.optString(it) } } ?: emptyList(), o.optString("lastContactAt")) }.filter { it.name.isNotBlank() && it.phone.isNotBlank() }
 } catch (_: Exception) { emptyList() }
-private fun persistCustomers(context: Context, list: List<Customer>) { val a = JSONArray(); list.forEach { c -> a.put(JSONObject().apply { put("id", c.id); put("name", c.name); put("phone", c.phone); put("company", c.company); put("note", c.note); put("status", c.status); put("followUp", c.followUp); put("tags", JSONArray(c.tags)) }) }; context.getSharedPreferences("nova_customers", Context.MODE_PRIVATE).edit().putString("data", a.toString()).apply() }
+private fun persistCustomers(context: Context, list: List<Customer>) { val a = JSONArray(); list.forEach { c -> a.put(JSONObject().apply { put("id", c.id); put("name", c.name); put("phone", c.phone); put("company", c.company); put("note", c.note); put("status", c.status); put("followUp", c.followUp); put("tags", JSONArray(c.tags)); put("lastContactAt", c.lastContactAt) }) }; context.getSharedPreferences("nova_customers", Context.MODE_PRIVATE).edit().putString("data", a.toString()).apply() }
 private fun loadTags(context: Context): List<CustomerTag> = try { val a = JSONArray(context.getSharedPreferences("nova_tags", Context.MODE_PRIVATE).getString("data", "[]") ?: "[]"); (0 until a.length()).map { val o = a.getJSONObject(it); CustomerTag(o.optString("name"), o.optLong("color", palette[0])) } } catch (_: Exception) { emptyList() }
 private fun persistTags(context: Context, list: List<CustomerTag>) { val a = JSONArray(); list.forEach { a.put(JSONObject().apply { put("name", it.name); put("color", it.color) }) }; context.getSharedPreferences("nova_tags", Context.MODE_PRIVATE).edit().putString("data", a.toString()).apply() }
+private fun lastCommunication(c: Customer): String {
+    if (c.lastContactAt.isNotBlank()) return c.lastContactAt
+    val pattern = Regex("^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}")
+    return c.note.lines().asReversed().firstNotNullOfOrNull { line -> pattern.find(line.trim())?.value } ?: "暂无记录"
+}
 private fun digits(s: String) = s.filter { it.isDigit() }
 private fun csvEscape(s: String) = "\"" + s.replace("\"", "\"\"").replace("\r", " ").replace("\n", " ") + "\""
 
