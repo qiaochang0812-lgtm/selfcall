@@ -517,21 +517,119 @@ private fun digits(s: String) = s.filter { it.isDigit() }
 private fun csvEscape(s: String) = "\"" + s.replace("\"", "\"\"").replace("\r", " ").replace("\n", " ") + "\""
 
 private fun rowsToCustomers(rows: List<List<String>>): List<Customer> {
-    val clean = rows.filter { it.any(String::isNotBlank) }; if (clean.isEmpty()) return emptyList()
-    fun norm(s: String) = s.trim().lowercase(Locale.ROOT).replace(" ", "").replace("_", "")
-    val nameKeys = setOf("姓名", "客户姓名", "name", "联系人", "联系人姓名"); val phoneKeys = setOf("电话", "手机号", "手机号码", "联系电话", "电话/手机", "phone", "mobile", "tel")
-    val headerIndex = clean.indexOfFirst { row -> row.any { norm(it) in nameKeys } && row.any { norm(it) in phoneKeys } }
+    val clean = rows.filter { it.any(String::isNotBlank) }
+    if (clean.isEmpty()) return emptyList()
+
+    fun norm(s: String) = s.trim().lowercase(Locale.ROOT)
+        .replace(" ", "").replace("_", "").replace("-", "").replace("（", "(").replace("）", ")")
+
+    val nameKeys = setOf("姓名", "客户姓名", "name", "联系人", "联系人姓名")
+    val companyKeys = setOf("单位", "单位名称", "公司", "公司名称", "企业名称", "company", "organization", "机构")
+    val phoneKeys = setOf(
+        "电话", "手机号", "手机号码", "联系电话", "电话/手机", "phone", "mobile", "tel",
+        "联系电话号码", "电话号码", "工商年报电话", "更多联系电话", "固定电话", "座机", "联系手机",
+        "手机1", "手机2", "电话1", "电话2", "联系电话1", "联系电话2"
+    )
+    fun isPhoneHeader(value: String): Boolean {
+        val h = norm(value)
+        return h in phoneKeys || h.startsWith("更多联系电话") ||
+            h.startsWith("工商年报电话") || h.startsWith("联系电话") ||
+            h.matches(Regex("^(手机|电话|手机号|mobile|phone|tel)\\d+$"))
+    }
+
+    // 支持常规客户表，也支持企业查询导出表（企业名称 + 多个联系电话字段）。
+    val headerIndex = clean.indexOfFirst { row ->
+        row.any { norm(it) in nameKeys || norm(it) in companyKeys } && row.any { isPhoneHeader(it) }
+    }
     val header = if (headerIndex >= 0) clean[headerIndex].map(::norm) else emptyList()
     fun col(keys: Set<String>) = header.indexOfFirst { it in keys }
-    val nc = col(nameKeys); val pc = col(phoneKeys); val cc = col(setOf("单位", "单位名称", "公司", "公司名称", "企业名称", "company", "organization", "机构")); val mc = col(setOf("备注", "备注情况", "沟通备注", "跟进情况", "客户情况", "说明", "note", "remark", "comments"))
+    val nc = col(nameKeys)
+    val cc = col(companyKeys)
+    val mc = col(setOf("备注", "备注情况", "沟通备注", "跟进情况", "客户情况", "说明", "note", "remark", "comments"))
+    val legalRepCol = col(setOf("法定代表人", "法人代表", "法人", "legalrepresentative"))
+    val addressCol = col(setOf("地址", "注册地址", "住所", "address"))
+    val industryCol = col(setOf("行业", "所属行业", "industry"))
+    val statusCol = col(setOf("经营状态", "企业状态", "状态", "status"))
+    val phoneCols = if (headerIndex >= 0) header.indices.filter { isPhoneHeader(header[it]) } else emptyList()
+
+    fun phoneNumbers(raw: String): List<String> {
+        val value = raw.trim()
+        if (value.isBlank()) return emptyList()
+        val result = linkedSetOf<String>()
+        // 常见企业导出使用分号；同时兼容中文逗号、顿号、斜线和换行分隔。
+        val chunks = value.split(Regex("[;；,，、/|\\n\\r]+"))
+        for (chunk in chunks) {
+            val s = chunk.trim()
+            if (s.isBlank()) continue
+            val digitsOnly = s.filter(Char::isDigit)
+            if (digitsOnly.length in 7..15 && s.none { it.isLetter() }) {
+                result.add(digitsOnly)
+                continue
+            }
+            // 有“电话：”等文字或括号、短横线时，提取其中的号码。
+            val beforeCount = result.size
+            Regex("(?<!\\d)\\+?\\d[\\d()\\-]{5,}\\d(?!\\d)").findAll(s).forEach { match ->
+                val d = match.value.filter(Char::isDigit)
+                if (d.length in 7..15) result.add(d)
+            }
+            // 有些表格用空格隔开多个完整号码。
+            if (result.size == beforeCount) {
+                s.split(Regex("\\s+")).forEach { token ->
+                    val d = token.filter(Char::isDigit)
+                    if (d.length in 7..15) result.add(d)
+                }
+            }
+        }
+        return result.toList()
+    }
+
+    val allSeenPhones = mutableSetOf<String>()
     return clean.mapIndexedNotNull { i, row ->
         if (i == headerIndex) return@mapIndexedNotNull null
-        val p = if (pc >= 0) pc else row.indexOfFirst { it.trim().matches(Regex("^\\+?[0-9][0-9() \\-]{5,}$")) }
-        if (p < 0 || row.getOrNull(p).isNullOrBlank()) return@mapIndexedNotNull null
-        val phone = row[p].trim(); val name = if (nc >= 0) row.getOrNull(nc).orEmpty().trim() else row.indices.firstOrNull { it != p && row[it].isNotBlank() }?.let { row[it].trim() }.orEmpty()
-        val company = if (cc >= 0) row.getOrNull(cc).orEmpty().trim() else row.getOrNull(2).orEmpty().trim(); val note = if (mc >= 0) row.getOrNull(mc).orEmpty().trim() else row.getOrNull(3).orEmpty().trim()
-        Customer(name = name.ifBlank { phone }, phone = phone, company = company, note = note)
-    }
+
+        val enterpriseMode = headerIndex >= 0 && cc >= 0 && phoneCols.isNotEmpty() &&
+            (nc < 0 || phoneCols.size > 1 || header.any { it == "工商年报电话" || it == "更多联系电话" })
+        if (enterpriseMode) {
+            val company = row.getOrNull(cc).orEmpty().trim()
+            if (company.isBlank()) return@mapIndexedNotNull null
+            val numbers = phoneCols.flatMap { phoneNumbers(row.getOrNull(it).orEmpty()) }
+                .filter { allSeenPhones.add(it) }
+            if (numbers.isEmpty()) return@mapIndexedNotNull null
+
+            val details = mutableListOf<String>()
+            row.getOrNull(legalRepCol).orEmpty().trim().takeIf { it.isNotBlank() }?.let { details.add("法定代表人：$it") }
+            row.getOrNull(addressCol).orEmpty().trim().takeIf { it.isNotBlank() }?.let { details.add("地址：$it") }
+            row.getOrNull(industryCol).orEmpty().trim().takeIf { it.isNotBlank() }?.let { details.add("行业：$it") }
+            row.getOrNull(statusCol).orEmpty().trim().takeIf { it.isNotBlank() }?.let { details.add("经营状态：$it") }
+            row.getOrNull(mc).orEmpty().trim().takeIf { it.isNotBlank() }?.let { details.add(it) }
+            val note = details.joinToString("；")
+
+            // 每个电话号码生成一条客户记录；同一单位的记录保持相邻，方便连续拨号。
+            return@mapIndexedNotNull numbers.map { number ->
+                Customer(
+                    name = company,
+                    phone = number,
+                    company = company,
+                    note = note
+                )
+            }
+        }
+
+        // 常规姓名/电话/单位格式兼容逻辑。
+        val p = if (headerIndex >= 0) {
+            header.indexOfFirst { isPhoneHeader(it) }.takeIf { it >= 0 }
+        } else null
+        val phoneIndex = p ?: row.indexOfFirst { it.trim().matches(Regex("^\\+?[0-9][0-9() \\-]{5,}$")) }
+        if (phoneIndex < 0 || row.getOrNull(phoneIndex).isNullOrBlank()) return@mapIndexedNotNull null
+
+        val numbers = phoneNumbers(row[phoneIndex]).filter { allSeenPhones.add(it) }
+        if (numbers.isEmpty()) return@mapIndexedNotNull null
+        val name = if (nc >= 0) row.getOrNull(nc).orEmpty().trim()
+            else row.indices.firstOrNull { it != phoneIndex && row[it].isNotBlank() }?.let { row[it].trim() }.orEmpty()
+        val company = if (cc >= 0) row.getOrNull(cc).orEmpty().trim() else row.getOrNull(2).orEmpty().trim()
+        val note = if (mc >= 0) row.getOrNull(mc).orEmpty().trim() else row.getOrNull(3).orEmpty().trim()
+        numbers.map { phone -> Customer(name = name.ifBlank { company.ifBlank { phone } }, phone = phone, company = company, note = note) }
+    }.flatten()
 }
 private fun readXlsx(context: Context, uri: Uri): List<List<String>> {
     val entries = mutableMapOf<String, ByteArray>()
