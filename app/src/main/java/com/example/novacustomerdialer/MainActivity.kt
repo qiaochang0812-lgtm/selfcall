@@ -105,6 +105,8 @@ private fun NovaApp() {
     var outcome by remember { mutableStateOf("已接通") }
     var outcomeNote by remember { mutableStateOf("") }
     var outcomeDate by remember { mutableStateOf("") }
+    var outcomeTags by remember { mutableStateOf(setOf<String>()) }
+    var outcomeTagMenu by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf("") }
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var showTagDialog by remember { mutableStateOf(false) }
@@ -141,7 +143,7 @@ private fun NovaApp() {
             if (event == Lifecycle.Event.ON_RESUME && pendingCall != null && callLaunched) {
                 callLaunched = false; callLogRefresh++
                 val c = customers.firstOrNull { it.id == pendingCall }
-                if (c != null) { outcome = c.status.takeIf { it != "待联系" } ?: "已接通"; outcomeNote = ""; outcomeDate = c.followUp; showOutcome = true }
+                if (c != null) { outcome = c.status.takeIf { it != "待联系" } ?: "已接通"; outcomeNote = ""; outcomeDate = ""; outcomeTags = c.tags.toSet(); showOutcome = true }
             }
         }
         lifecycle.lifecycle.addObserver(observer)
@@ -191,10 +193,16 @@ private fun NovaApp() {
         val c = current ?: return
         val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date())
         val appended = if (outcomeNote.isBlank()) c.note else listOf(c.note, "$stamp：${outcomeNote.trim()}").filter { it.isNotBlank() }.joinToString("\n")
-        saveCustomers(customers.map { if (it.id == c.id) it.copy(status = outcome, note = appended, followUp = outcomeDate.trim(), lastContactAt = stamp) else it })
-        val idx = customers.indexOfFirst { it.id == c.id }
-        if (goNext) { val next = customers.drop(idx + 1).firstOrNull { it.id != c.id }; if (next != null) currentId = next.id else message = "记录已保存，当前已是最后一位。" }
-        showOutcome = false; pendingCall = null; message = if (goNext && idx < customers.lastIndex) "记录已保存，已切换下一位。" else "沟通记录已保存。"
+        saveCustomers(customers.map { if (it.id == c.id) it.copy(status = outcome, note = appended, followUp = outcomeDate.trim(), tags = outcomeTags.toList(), lastContactAt = stamp) else it })
+        val idx = dialerCustomers.indexOfFirst { it.id == c.id }
+        val next = if (goNext && idx >= 0) dialerCustomers.drop(idx + 1).firstOrNull { it.id != c.id } else null
+        showOutcome = false
+        pendingCall = null
+        message = if (goNext && next != null) "记录已保存，正在拨打下一位。" else if (goNext) "记录已保存，当前筛选名单已到最后一位。" else "沟通记录已保存。"
+        if (next != null) {
+            currentId = next.id
+            startCustomerCall(next)
+        }
     }
 
     Scaffold(
@@ -453,14 +461,50 @@ private fun NovaApp() {
         val exists = customers.any { it.id == c.id }; saveCustomers(if (exists) customers.map { if (it.id == c.id) c else it } else listOf(c) + customers); currentId = c.id; showEditor = false; message = if (exists) "客户资料已保存。" else "客户已新增。"
     }, onDelete = { c -> saveCustomers(customers.filterNot { it.id == c.id }); showEditor = false; message = "客户已删除。" }, onCreateTag = { name -> if (tags.none { it.name.equals(name,true) }) saveTags(tags + CustomerTag(name, palette[tags.size % palette.size])) })
 
-    if (showOutcome && current != null) AlertDialog(onDismissRequest = { showOutcome = false; pendingCall = null }, title = { Text("快速记录 · ${current.name}") }, text = {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            callStatuses.filter { it != "待联系" }.chunked(2).forEach { row -> Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) { row.forEach { s -> FilterChip(selected = outcome == s, onClick = { outcome = s }, label = { Text(s) }, modifier = Modifier.weight(1f)) } } }
-            OutlinedTextField(outcomeNote, { outcomeNote = it }, label = { Text("本次沟通情况") }, placeholder = { Text("例如：有意向，下周报价") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
-            OutlinedTextField(outcomeDate, { outcomeDate = it }, label = { Text("下次回访日期（可选）") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-            Text("可在客户管理中继续维护标签。", style = MaterialTheme.typography.bodySmall)
-        }
-    }, confirmButton = { Column { Button(onClick = { saveOutcome(false) }, Modifier.fillMaxWidth()) { Text("保存记录") }; Button(onClick = { saveOutcome(true) }, Modifier.fillMaxWidth()) { Text("保存并拨下一位") } } }, dismissButton = { TextButton(onClick = { showOutcome = false; pendingCall = null }) { Text("稍后记录") } })
+    if (showOutcome && current != null) AlertDialog(
+        onDismissRequest = { showOutcome = false; pendingCall = null },
+        title = { Text("快速记录 · ${current.name}") },
+        text = {
+            Column(Modifier.fillMaxWidth().heightIn(max = 440.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                callStatuses.filter { it != "待联系" }.chunked(2).forEach { row ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        row.forEach { st -> FilterChip(selected = outcome == st, onClick = { outcome = st }, label = { Text(st, maxLines = 1) }, modifier = Modifier.weight(1f)) }
+                    }
+                }
+                OutlinedTextField(outcomeNote, { outcomeNote = it }, label = { Text("本次沟通情况") }, placeholder = { Text("例如：有意向，下周报价") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
+                OutlinedButton(onClick = {
+                    val cal = Calendar.getInstance()
+                    val parsed = try { if (outcomeDate.isNotBlank()) SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).parse(outcomeDate) else null } catch (_: Exception) { null }
+                    if (parsed != null) cal.time = parsed else cal.add(Calendar.DAY_OF_YEAR, 1)
+                    DatePickerDialog(context, { _, y, m, d -> outcomeDate = String.format(Locale.ROOT, "%04d-%02d-%02d", y, m + 1, d) }, cal.get(Calendar.YEAR), cal.get(Calendar.MONTH), cal.get(Calendar.DAY_OF_MONTH)).show()
+                }, modifier = Modifier.fillMaxWidth()) {
+                    Text(if (outcomeDate.isBlank()) "下次回访日期：不设置（点击选择）" else "下次回访：$outcomeDate（点击修改）")
+                }
+                Box {
+                    OutlinedButton(onClick = { outcomeTagMenu = true }, modifier = Modifier.fillMaxWidth()) {
+                        Text(if (outcomeTags.isEmpty()) "客户标签：未选择（点击选择）" else "客户标签：${outcomeTags.joinToString("、")}")
+                    }
+                    DropdownMenu(expanded = outcomeTagMenu, onDismissRequest = { outcomeTagMenu = false }) {
+                        if (tags.isEmpty()) DropdownMenuItem(text = { Text("请先在设置中创建标签") }, onClick = { outcomeTagMenu = false })
+                        tags.forEach { tag ->
+                            DropdownMenuItem(text = {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Box(Modifier.size(10.dp).background(Color(tag.color), RoundedCornerShape(50)))
+                                    Spacer(Modifier.width(8.dp)); Text(tag.name); Spacer(Modifier.weight(1f))
+                                    if (tag.name in outcomeTags) Icon(Icons.Filled.CheckCircle, contentDescription = "已选择")
+                                }
+                            }, onClick = { outcomeTags = if (tag.name in outcomeTags) outcomeTags - tag.name else outcomeTags + tag.name })
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = { saveOutcome(false) }, modifier = Modifier.fillMaxWidth()) { Text("保存记录") }
+            Button(onClick = { saveOutcome(true) }, modifier = Modifier.fillMaxWidth()) { Text("保存并拨下一位") }
+        } },
+        dismissButton = { TextButton(onClick = { showOutcome = false; pendingCall = null }) { Text("稍后记录") } }
+    )
 
     if (showDeleteConfirm) AlertDialog(onDismissRequest = { showDeleteConfirm = false }, title = { Text("批量删除客户") }, text = { Text("确定删除已选的 ${selected.size} 位客户？此操作不可撤销。") }, confirmButton = { Button(onClick = { val n = selected.size; saveCustomers(customers.filterNot { it.id in selected }); selected = emptySet(); showDeleteConfirm = false; message = "已删除 $n 位客户。" }) { Text("确认删除") } }, dismissButton = { TextButton(onClick = { showDeleteConfirm = false }) { Text("取消") } })
 
