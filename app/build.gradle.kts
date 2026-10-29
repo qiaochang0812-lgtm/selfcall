@@ -12,8 +12,8 @@ android {
         applicationId = "com.example.novacustomerdialer"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.4.1"
+        versionCode = 6
+        versionName = "0.4.4"
     }
 
     compileOptions {
