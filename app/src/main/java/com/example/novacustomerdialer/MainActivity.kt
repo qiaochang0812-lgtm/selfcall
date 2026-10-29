@@ -365,6 +365,73 @@ private fun NovaApp() {
                     Text("系统拨出次数和时长来自 Android 通话记录；接通以系统记录的通话时长大于 0 估算。客户沟通状态统计仍来自应用内记录。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF737D8B))
                 }
             }
+            Page.SETTINGS -> Column(
+                Modifier.fillMaxSize().padding(insets).padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text("应用设置", style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.SemiBold)
+                Text("管理客户分类、查看沟通统计和维护客户数据。",
+                    color = Color(0xFF64748B))
+
+                Card(
+                    onClick = { page = Page.TAGS },
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color.White)
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(18.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Filled.People, contentDescription = null)
+                        Column(
+                            Modifier.weight(1f).padding(horizontal = 14.dp)
+                        ) {
+                            Text("客户标签", fontWeight = FontWeight.SemiBold)
+                            Text("创建、编辑标签及颜色",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFF64748B))
+                        }
+                        Icon(Icons.Filled.ChevronRight, contentDescription = null)
+                    }
+                }
+
+                Card(
+                    onClick = { page = Page.STATS },
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color.White)
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(18.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Filled.BarChart, contentDescription = null)
+                        Column(
+                            Modifier.weight(1f).padding(horizontal = 14.dp)
+                        ) {
+                            Text("沟通统计", fontWeight = FontWeight.SemiBold)
+                            Text("当天与当月拨出记录和跟进情况",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFF64748B))
+                        }
+                        Icon(Icons.Filled.ChevronRight, contentDescription = null)
+                    }
+                }
+
+                Card(shape = RoundedCornerShape(16.dp)) {
+                    Column(
+                        Modifier.fillMaxWidth().padding(18.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text("本机客户数据", fontWeight = FontWeight.SemiBold)
+                        Text("当前客户数量：${customers.size}")
+                        Text("请定期在客户管理页导出备份。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color(0xFF64748B))
+                    }
+                }
+            }
+
             Page.TAGS -> Column(Modifier.fillMaxSize().padding(insets).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text("自定义标签", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 Text("标签用于业务分类，可为客户添加多个标签，并在客户列表组合筛选。", color = Color(0xFF64748B))
