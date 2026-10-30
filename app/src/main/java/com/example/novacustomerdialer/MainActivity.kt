@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.provider.CallLog
+import android.telecom.TelecomManager
+import android.telephony.SubscriptionManager
 import android.app.DatePickerDialog
 import android.content.Intent
 import android.net.Uri
@@ -147,6 +149,12 @@ private fun NovaApp(
     var showBulkStatusMenu by remember { mutableStateOf(false) }
     var callLogPermissionGranted by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED) }
     var callLogRefresh by remember { mutableIntStateOf(0) }
+    var phoneStateGranted by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED) }
+    var showBulkTagMenu by remember { mutableStateOf(false) }
+    val settingsPrefs = remember { context.getSharedPreferences("nova_settings", Context.MODE_PRIVATE) }
+    var simMode by remember { mutableStateOf(settingsPrefs.getString("simMode", "system") ?: "system") }
+    var simRotationIndex by remember { mutableIntStateOf(settingsPrefs.getInt("simRotationIndex", 0)) }
+    var pendingCallIntent by remember { mutableStateOf<Intent?>(null) }
     var outcome by remember { mutableStateOf("已接通") }
     var outcomeNote by remember { mutableStateOf("") }
     var outcomeDate by remember { mutableStateOf("") }
@@ -156,20 +164,59 @@ private fun NovaApp(
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var showTagDialog by remember { mutableStateOf(false) }
     var editingTag by remember { mutableStateOf<CustomerTag?>(null) }
-    var showStatusMenu by remember { mutableStateOf(false) }
+    var showCustomerStatusMenu by remember { mutableStateOf(false) }
+    var showDialerStatusMenu by remember { mutableStateOf(false) }
     var statsPeriod by remember { mutableStateOf("当天统计") }
 
     fun saveCustomers(value: List<Customer>) { customers = value; persistCustomers(context, value); if (value.none { it.id == currentId }) currentId = value.firstOrNull()?.id; selected = selected.intersect(value.map { it.id }.toSet()) }
     fun saveTags(value: List<CustomerTag>) { tags = value; persistTags(context, value) }
 
+    val phoneStatePermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        phoneStateGranted = granted
+        if (!granted) {
+            simMode = "system"
+            settingsPrefs.edit().putString("simMode", "system").apply()
+            message = "未授权读取电话账户，已切回系统默认拨号方式。"
+        } else message = "电话账户权限已授权，可尝试指定 SIM 卡。"
+    }
+    fun buildCustomerCallIntent(customer: Customer): Intent {
+        val uri = Uri.parse("tel:${Uri.encode(customer.phone)}")
+        if (simMode == "system") return Intent(Intent.ACTION_CALL, uri)
+        val slots = when (simMode) {
+            "sim1" -> listOf(0)
+            "sim2" -> listOf(1)
+            "rotate" -> {
+                val first = if (simRotationIndex % 2 == 0) 0 else 1
+                simRotationIndex = (simRotationIndex + 1) % 2
+                settingsPrefs.edit().putInt("simRotationIndex", simRotationIndex).apply()
+                listOf(first, 1 - first)
+            }
+            else -> emptyList()
+        }
+        val account = slots.firstNotNullOfOrNull { slot -> phoneAccountForSlot(context, slot) }
+        if (account == null) {
+            message = "未能识别所选 SIM 的通话账户，已打开系统拨号界面，请在系统界面确认 SIM 卡。"
+            return Intent(Intent.ACTION_DIAL, uri)
+        }
+        return Intent(Intent.ACTION_CALL, uri).putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, account)
+    }
+    fun launchPendingCall(intent: Intent) {
+        callLaunched = true
+        context.startActivity(intent)
+    }
     val callPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) {
-            val c = customers.firstOrNull { it.id == pendingCall }
-            if (c != null) try {
-                callLaunched = true
-                context.startActivity(Intent(Intent.ACTION_CALL, Uri.parse("tel:${Uri.encode(c.phone)}")))
-            } catch (_: Exception) { pendingCall = null; callLaunched = false; message = "无法发起通话，请检查电话权限。" }
-        } else { pendingCall = null; callLaunched = false; message = "未授予拨打电话权限，无法直接拨号。" }
+        val c = customers.firstOrNull { it.id == pendingCall }
+        val prepared = pendingCallIntent
+        if (c != null && prepared != null) try {
+            if (granted) launchPendingCall(prepared)
+            else {
+                message = "未授予直接拨号权限，已打开系统拨号界面，请手动确认拨出。"
+                launchPendingCall(Intent(Intent.ACTION_DIAL, prepared.data))
+            }
+        } catch (_: Exception) {
+            pendingCall = null; callLaunched = false
+            message = "无法打开拨号界面，请检查系统电话应用。"
+        } finally { pendingCallIntent = null }
     }
     val callLogPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         callLogPermissionGranted = granted
@@ -177,9 +224,12 @@ private fun NovaApp(
     }
     fun startCustomerCall(customer: Customer) {
         pendingCall = customer.id
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) {
-            try { callLaunched = true; context.startActivity(Intent(Intent.ACTION_CALL, Uri.parse("tel:${Uri.encode(customer.phone)}"))) }
-            catch (_: Exception) { pendingCall = null; callLaunched = false; message = "无法发起通话，请检查系统电话应用和权限。" }
+        val prepared = buildCustomerCallIntent(customer)
+        pendingCallIntent = prepared
+        if (prepared.action == Intent.ACTION_DIAL ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) {
+            try { launchPendingCall(prepared); pendingCallIntent = null }
+            catch (_: Exception) { pendingCall = null; callLaunched = false; pendingCallIntent = null; message = "无法打开系统拨号界面。" }
         } else callPermissionLauncher.launch(Manifest.permission.CALL_PHONE)
     }
 
@@ -188,7 +238,7 @@ private fun NovaApp(
             if (event == Lifecycle.Event.ON_RESUME && pendingCall != null && callLaunched) {
                 callLaunched = false; callLogRefresh++
                 val c = customers.firstOrNull { it.id == pendingCall }
-                if (c != null) { outcome = c.status.takeIf { it != "待联系" } ?: "已接通"; outcomeNote = ""; outcomeDate = ""; outcomeTags = c.tags.toSet(); showOutcome = true }
+                if (c != null) { outcome = c.status.takeIf { it != "待联系" } ?: "已接通"; outcomeNote = ""; outcomeDate = c.followUp; outcomeTags = c.tags.toSet(); showOutcome = true }
             }
         }
         lifecycle.lifecycle.addObserver(observer)
@@ -233,6 +283,9 @@ private fun NovaApp(
     val visible = customers.filter { c ->
         (search.isBlank() || c.name.contains(search, true) || c.phone.contains(search, true) || c.company.contains(search, true)) &&
         (statusFilter == "全部状态" || c.status == statusFilter) && (selectedTags.isEmpty() || selectedTags.all { it in c.tags })
+    }
+    val customerCallLogs = remember(callLogPermissionGranted, callLogRefresh, customers) {
+        if (callLogPermissionGranted) queryCustomerCallLogs(context) else emptyMap()
     }
     fun saveOutcome(goNext: Boolean) {
         val c = current ?: return
@@ -291,13 +344,18 @@ private fun NovaApp(
             )
             Page.CUSTOMERS -> Column(Modifier.fillMaxSize().padding(insets).padding(horizontal = 14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(search, { search = it }, Modifier.fillMaxWidth(), label = { Text("搜索姓名、电话、单位") }, singleLine = true, shape = RoundedCornerShape(16.dp))
+                if (!callLogPermissionGranted) {
+                    TextButton(onClick = { callLogPermissionLauncher.launch(Manifest.permission.READ_CALL_LOG) }) {
+                        Text("授权后匹配客户的系统通话记录")
+                    }
+                }
                 Text("客户标签（可多选组合筛选）", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     item { FilterChip(selected = selectedTags.isEmpty(), onClick = { selectedTags = emptySet() }, label = { Text("全部") }) }
                     items(tags, key = { it.name }) { t -> FilterChip(selected = t.name in selectedTags, onClick = { selectedTags = if (t.name in selectedTags) selectedTags - t.name else selectedTags + t.name }, label = { Text(t.name) }, leadingIcon = { Box(Modifier.size(9.dp).background(Color(t.color), RoundedCornerShape(50))) }) }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box { OutlinedButton(onClick = { showStatusMenu = true }) { Text(statusFilter) }; DropdownMenu(expanded = showStatusMenu, onDismissRequest = { showStatusMenu = false }) { (listOf("全部状态") + callStatuses).forEach { s -> DropdownMenuItem(text = { Text(s) }, onClick = { statusFilter = s; showStatusMenu = false }) } } }
+                    Box { OutlinedButton(onClick = { showCustomerStatusMenu = true }) { Text(statusFilter) }; DropdownMenu(expanded = showCustomerStatusMenu, onDismissRequest = { showCustomerStatusMenu = false }) { (listOf("全部状态") + callStatuses).forEach { s -> DropdownMenuItem(text = { Text(s) }, onClick = { statusFilter = s; showCustomerStatusMenu = false }) } } }
                     Text("  ${visible.size} 位客户", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B), modifier = Modifier.weight(1f))
                     TextButton(onClick = { selected = visible.map { it.id }.toSet() }) { Text("全选") }
                     TextButton(onClick = { selected = emptySet() }) { Text("清除") }
@@ -306,32 +364,69 @@ private fun NovaApp(
                     OutlinedButton(onClick = { importLauncher.launch(arrayOf("text/*", "text/csv", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/octet-stream")) }, modifier = Modifier.weight(1f)) { Text("导入") }
                     OutlinedButton(onClick = { exportLauncher.launch("沟通无限-客户名单.csv") }, modifier = Modifier.weight(1f)) { Text("导出") }
                 }
-                if (selected.isNotEmpty()) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("已选 ${selected.size} 位", Modifier.weight(1f), color = MaterialTheme.colorScheme.primary, maxLines = 1)
-                    Box {
-                        TextButton(onClick = { showBulkStatusMenu = true }) { Text("改状态") }
-                        DropdownMenu(expanded = showBulkStatusMenu, onDismissRequest = { showBulkStatusMenu = false }) {
-                            callStatuses.forEach { status -> DropdownMenuItem(text = { Text(status) }, onClick = {
+                if (selected.isNotEmpty()) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("已选 ${selected.size} 位", Modifier.weight(1f), color = MaterialTheme.colorScheme.primary, maxLines = 1)
+                            Box {
+                                TextButton(onClick = { showBulkStatusMenu = true }) { Text("改状态") }
+                                DropdownMenu(expanded = showBulkStatusMenu, onDismissRequest = { showBulkStatusMenu = false }) {
+                                    callStatuses.forEach { status -> DropdownMenuItem(text = { Text(status) }, onClick = {
+                                        val ids = selected
+                                        saveCustomers(customers.map { if (it.id in ids) it.copy(status = status) else it })
+                                        selected = emptySet(); showBulkStatusMenu = false; message = "已批量修改为「$status」。"
+                                    }) }
+                                }
+                            }
+                            TextButton(onClick = { showDeleteConfirm = true }) { Text("批量删除") }
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Box {
+                                OutlinedButton(onClick = { showBulkTagMenu = true }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)) { Text("批量标签") }
+                                DropdownMenu(expanded = showBulkTagMenu, onDismissRequest = { showBulkTagMenu = false }) {
+                                    tags.forEach { tag ->
+                                        DropdownMenuItem(text = { Text("添加：${tag.name}") }, onClick = {
+                                            val ids = selected
+                                            saveCustomers(customers.map { c -> if (c.id in ids) c.copy(tags = (c.tags + tag.name).distinct()) else c })
+                                            showBulkTagMenu = false; message = "已为所选客户添加标签「${tag.name}」。"
+                                        })
+                                        DropdownMenuItem(text = { Text("移除：${tag.name}") }, onClick = {
+                                            val ids = selected
+                                            saveCustomers(customers.map { c -> if (c.id in ids) c.copy(tags = c.tags - tag.name) else c })
+                                            showBulkTagMenu = false; message = "已从所选客户移除标签「${tag.name}」。"
+                                        })
+                                    }
+                                }
+                            }
+                            OutlinedButton(onClick = {
+                                val cal = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, 1) }
+                                DatePickerDialog(context, { _, y, m, d ->
+                                    val date = String.format(Locale.ROOT, "%04d-%02d-%02d", y, m + 1, d)
+                                    val ids = selected
+                                    saveCustomers(customers.map { c -> if (c.id in ids) c.copy(followUp = date) else c })
+                                    message = "已为所选客户设置回访日期：$date。"
+                                }, cal.get(Calendar.YEAR), cal.get(Calendar.MONTH), cal.get(Calendar.DAY_OF_MONTH)).show()
+                            }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)) { Text("设回访日期") }
+                            TextButton(onClick = {
                                 val ids = selected
-                                saveCustomers(customers.map { if (it.id in ids) it.copy(status = status) else it })
-                                selected = emptySet(); showBulkStatusMenu = false; message = "已批量修改为「$status」。"
-                            }) }
+                                saveCustomers(customers.map { c -> if (c.id in ids) c.copy(followUp = "") else c })
+                                message = "已清除所选客户的回访日期。"
+                            }, contentPadding = PaddingValues(horizontal = 6.dp, vertical = 6.dp)) { Text("清除日期") }
                         }
                     }
-                    TextButton(onClick = { showDeleteConfirm = true }) { Text("批量删除") }
                 }
                 if (visible.isEmpty()) EmptyCard("没有匹配客户", "点击右下角 + 新增，或导入 Excel/CSV 文件。")
                 LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(9.dp), contentPadding = PaddingValues(bottom = 90.dp)) {
-                    items(visible, key = { it.id }) { c -> CustomerCard(c, tags, c.id in selected, onSelect = { yes -> selected = if (yes) selected + c.id else selected - c.id }, onOpen = { currentId = c.id; page = Page.DIALER }, onEdit = { editing = c; showEditor = true }) }
+                    items(visible, key = { it.id }) { c -> CustomerCard(c, tags, c.id in selected, customerCallLogs[phoneMatchKey(c.phone)]?.let(::formatCustomerCall), callLogPermissionGranted, onSelect = { yes -> selected = if (yes) selected + c.id else selected - c.id }, onOpen = { currentId = c.id; page = Page.DIALER }, onEdit = { editing = c; showEditor = true }) }
                 }
             }
             Page.DIALER -> Column(Modifier.fillMaxSize().padding(insets).padding(horizontal = 12.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Text("拨号名单", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
                     Box {
-                        OutlinedButton(onClick = { showStatusMenu = true }, contentPadding = PaddingValues(horizontal = 10.dp, vertical = 7.dp)) { Text(dialerStatusFilter, maxLines = 1, softWrap = false) }
-                        DropdownMenu(expanded = showStatusMenu, onDismissRequest = { showStatusMenu = false }) {
-                            (listOf("全部状态") + callStatuses).forEach { status -> DropdownMenuItem(text = { Text(status) }, onClick = { dialerStatusFilter = status; dialerQuickFilter = "全部名单"; showStatusMenu = false; val filtered = customers.filter { status == "全部状态" || it.status == status }; if (filtered.none { it.id == currentId }) currentId = filtered.firstOrNull()?.id }) }
+                        OutlinedButton(onClick = { showDialerStatusMenu = true }, contentPadding = PaddingValues(horizontal = 10.dp, vertical = 7.dp)) { Text(dialerStatusFilter, maxLines = 1, softWrap = false) }
+                        DropdownMenu(expanded = showDialerStatusMenu, onDismissRequest = { showDialerStatusMenu = false }) {
+                            (listOf("全部状态") + callStatuses).forEach { status -> DropdownMenuItem(text = { Text(status) }, onClick = { dialerStatusFilter = status; dialerQuickFilter = "全部名单"; showDialerStatusMenu = false; val filtered = customers.filter { status == "全部状态" || it.status == status }; if (filtered.none { it.id == currentId }) currentId = filtered.firstOrNull()?.id }) }
                         }
                     }
                 }
@@ -350,7 +445,7 @@ private fun NovaApp(
                                 }
                                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                     OutlinedButton(onClick = { val i = dialerCustomers.indexOfFirst { it.id == current.id }; if (i > 0) currentId = dialerCustomers[i - 1].id }, enabled = dialerCustomers.indexOfFirst { it.id == current.id } > 0, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)) { Text("上一位", maxLines = 1, softWrap = false) }
-                                    TextButton(onClick = { outcome = current.status.takeIf { it != "待联系" } ?: "已接通"; outcomeNote = ""; outcomeDate = current.followUp; showOutcome = true }, modifier = Modifier.weight(1.15f), contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)) { Text("记录结果", maxLines = 1, softWrap = false) }
+                                    TextButton(onClick = { outcome = current.status.takeIf { it != "待联系" } ?: "已接通"; outcomeNote = ""; outcomeDate = current.followUp; outcomeTags = current.tags.toSet(); showOutcome = true }, modifier = Modifier.weight(1.15f), contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)) { Text("记录结果", maxLines = 1, softWrap = false) }
                                     OutlinedButton(onClick = { val i = dialerCustomers.indexOfFirst { it.id == current.id }; dialerCustomers.getOrNull(i + 1)?.let { currentId = it.id } ?: run { message = "当前名单已到末尾。" } }, enabled = dialerCustomers.indexOfFirst { it.id == current.id } >= 0 && dialerCustomers.indexOfFirst { it.id == current.id } < dialerCustomers.lastIndex, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)) { Text("下一位", maxLines = 1, softWrap = false) }
                                 }
                             }
@@ -530,6 +625,26 @@ private fun NovaApp(
                 }
 
                 Card(shape = RoundedCornerShape(16.dp)) {
+                    Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("双卡拨号设置", fontWeight = FontWeight.SemiBold)
+                        Text("可选择系统默认、SIM1、SIM2或轮换。SIM 卡槽需能与 Android 通话账户匹配；识别失败时会打开系统拨号界面供你确认。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            FilterChip(selected = simMode == "system", onClick = { simMode = "system"; settingsPrefs.edit().putString("simMode", simMode).apply() }, label = { Text("系统默认") })
+                            FilterChip(selected = simMode == "sim1", onClick = { simMode = "sim1"; settingsPrefs.edit().putString("simMode", simMode).apply() }, label = { Text("SIM1") })
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            FilterChip(selected = simMode == "sim2", onClick = { simMode = "sim2"; settingsPrefs.edit().putString("simMode", simMode).apply() }, label = { Text("SIM2") })
+                            FilterChip(selected = simMode == "rotate", onClick = { simMode = "rotate"; settingsPrefs.edit().putString("simMode", simMode).apply() }, label = { Text("按拨号轮换") })
+                        }
+                        if (!phoneStateGranted) {
+                            OutlinedButton(onClick = { phoneStatePermissionLauncher.launch(Manifest.permission.READ_PHONE_STATE) }, modifier = Modifier.fillMaxWidth()) {
+                                Text("授权读取电话账户")
+                            }
+                        } else Text("电话账户权限已授权；拨号时将尝试按卡槽匹配 SIM。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                    }
+                }
+
+                Card(shape = RoundedCornerShape(16.dp)) {
                     Column(
                         Modifier.fillMaxWidth().padding(18.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
@@ -698,7 +813,7 @@ private fun HomeScreen(
 }
 
 @Composable private fun MetricCard(label: String, value: String, modifier: Modifier = Modifier) { Card(modifier, shape = RoundedCornerShape(18.dp)) { Column(Modifier.fillMaxWidth().padding(14.dp)) { Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Color(0xFF245BDB)); Text(label, style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B)) } } }
-@Composable private fun CustomerCard(c: Customer, tags: List<CustomerTag>, selected: Boolean, onSelect: (Boolean) -> Unit, onOpen: () -> Unit, onEdit: () -> Unit) {
+@Composable private fun CustomerCard(c: Customer, tags: List<CustomerTag>, selected: Boolean, callSummary: String?, callLogAccess: Boolean, onSelect: (Boolean) -> Unit, onOpen: () -> Unit, onEdit: () -> Unit) {
     Card(shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = if (selected) Color(0xFFEAF0FF) else Color.White)) { Column(Modifier.fillMaxWidth().padding(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(checked = selected, onCheckedChange = onSelect)
@@ -707,6 +822,12 @@ private fun HomeScreen(
         }
         if (c.tags.isNotEmpty()) Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) { c.tags.forEach { name -> val tag = tags.firstOrNull { it.name == name }; AssistChip(onClick = {}, label = { Text(name) }, leadingIcon = { Box(Modifier.size(8.dp).background(Color(tag?.color ?: palette[0]), RoundedCornerShape(50))) }) } }
         if (c.note.isNotBlank()) Text("备注：${c.note.takeLast(90)}", style = MaterialTheme.typography.bodySmall, maxLines = 2, color = Color(0xFF475569))
+        Text(
+            if (!callLogAccess) "系统通话：授权后匹配" else callSummary ?: "系统通话：暂无匹配记录",
+            style = MaterialTheme.typography.bodySmall,
+            color = Color(0xFF64748B),
+            maxLines = 1
+        )
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) { TextButton(onClick = onOpen) { Text("拨号 / 详情") }; TextButton(onClick = onEdit) { Text("编辑") } }
     } }
 }
@@ -760,7 +881,63 @@ private fun HomeScreen(
     } }, confirmButton = { Button(onClick = { if (name.isBlank()) error = "请输入标签名称。" else onSave(CustomerTag(name.trim(), color)) }) { Text("保存") } }, dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } })
 }
 
-private data class SystemCallRecord(val number: String, val dateMillis: Long, val durationSeconds: Long)
+private data class SystemCallRecord(val number: String, val dateMillis: Long, val durationSeconds: Long, val type: Int = CallLog.Calls.OUTGOING_TYPE)
+
+private fun phoneAccountForSlot(context: Context, slotIndex: Int): android.telecom.PhoneAccountHandle? {
+    if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) return null
+    return try {
+        val subscriptions = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as? SubscriptionManager ?: return null
+        val sub = subscriptions.activeSubscriptionInfoList?.firstOrNull { it.simSlotIndex == slotIndex } ?: return null
+        val telecom = context.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager ?: return null
+        telecom.callCapablePhoneAccounts.firstOrNull { it.id == sub.subscriptionId.toString() }
+    } catch (_: SecurityException) { null } catch (_: Exception) { null }
+}
+
+private fun phoneMatchKey(number: String): String {
+    val d = digits(number)
+    return when {
+        d.startsWith("0086") && d.length > 11 -> d.drop(4)
+        d.startsWith("86") && d.length > 11 -> d.drop(2)
+        else -> d
+    }
+}
+
+private fun queryCustomerCallLogs(context: Context): Map<String, SystemCallRecord> {
+    if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) return emptyMap()
+    val result = linkedMapOf<String, SystemCallRecord>()
+    val projection = arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.DATE, CallLog.Calls.DURATION, CallLog.Calls.TYPE)
+    try {
+        context.contentResolver.query(CallLog.Calls.CONTENT_URI, projection, null, null, "${CallLog.Calls.DATE} DESC")?.use { cursor ->
+            val numberIndex = cursor.getColumnIndexOrThrow(CallLog.Calls.NUMBER)
+            val dateIndex = cursor.getColumnIndexOrThrow(CallLog.Calls.DATE)
+            val durationIndex = cursor.getColumnIndexOrThrow(CallLog.Calls.DURATION)
+            val typeIndex = cursor.getColumnIndexOrThrow(CallLog.Calls.TYPE)
+            while (cursor.moveToNext()) {
+                val number = cursor.getString(numberIndex).orEmpty()
+                val key = phoneMatchKey(number)
+                if (key.isNotBlank() && key !in result) {
+                    result[key] = SystemCallRecord(number, cursor.getLong(dateIndex), cursor.getLong(durationIndex), cursor.getInt(typeIndex))
+                }
+            }
+        }
+    } catch (_: SecurityException) { return emptyMap() } catch (_: Exception) { return emptyMap() }
+    return result
+}
+
+private fun formatCustomerCall(record: SystemCallRecord): String {
+    val type = when (record.type) {
+        CallLog.Calls.INCOMING_TYPE -> "呼入"
+        CallLog.Calls.OUTGOING_TYPE -> "呼出"
+        CallLog.Calls.MISSED_TYPE -> "未接"
+        CallLog.Calls.REJECTED_TYPE -> "拒接"
+        CallLog.Calls.BLOCKED_TYPE -> "拦截"
+        CallLog.Calls.VOICEMAIL_TYPE -> "语音留言"
+        else -> "通话"
+    }
+    val time = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(record.dateMillis))
+    val duration = if (record.durationSeconds > 0) " · ${record.durationSeconds}秒" else ""
+    return "系统通话：$type $time$duration"
+}
 
 private fun queryOutgoingCalls(context: Context, periodStartMillis: Long): List<SystemCallRecord> {
     if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) return emptyList()
@@ -772,7 +949,13 @@ private fun queryOutgoingCalls(context: Context, periodStartMillis: Long): List<
             val numberIndex = cursor.getColumnIndexOrThrow(CallLog.Calls.NUMBER)
             val dateIndex = cursor.getColumnIndexOrThrow(CallLog.Calls.DATE)
             val durationIndex = cursor.getColumnIndexOrThrow(CallLog.Calls.DURATION)
-            while (cursor.moveToNext()) result += SystemCallRecord(cursor.getString(numberIndex).orEmpty(), cursor.getLong(dateIndex), cursor.getLong(durationIndex))
+            val typeIndex = cursor.getColumnIndex(CallLog.Calls.TYPE)
+            while (cursor.moveToNext()) result += SystemCallRecord(
+                cursor.getString(numberIndex).orEmpty(),
+                cursor.getLong(dateIndex),
+                cursor.getLong(durationIndex),
+                if (typeIndex >= 0) cursor.getInt(typeIndex) else CallLog.Calls.OUTGOING_TYPE
+            )
         }
     } catch (_: SecurityException) { return emptyList() } catch (_: Exception) { return emptyList() }
     return result
