@@ -23,6 +23,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.People
@@ -195,27 +197,33 @@ private fun NovaApp(
         }
         val account = slots.firstNotNullOfOrNull { slot -> phoneAccountForSlot(context, slot) }
         if (account == null) {
-            message = "未能识别所选 SIM 的通话账户，已打开系统拨号界面，请在系统界面确认 SIM 卡。"
-            return Intent(Intent.ACTION_DIAL, uri)
+            message = "未识别到所选 SIM 的通话账户。请授权读取电话账户，并确认该 SIM 已启用语音通话；本次不会改用其他卡或跳转拨号盘。"
+            return Intent("com.example.novacustomerdialer.NO_SIM_ACCOUNT", uri)
         }
         return Intent(Intent.ACTION_CALL, uri).putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, account)
     }
     fun launchPendingCall(intent: Intent) {
         callLaunched = true
-        context.startActivity(intent)
+        val account = intent.getParcelableExtra<android.telecom.PhoneAccountHandle>(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE)
+        if (account != null) {
+            val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+            val extras = Bundle().apply { putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, account) }
+            telecom.placeCall(intent.data ?: error("缺少电话号码"), extras)
+        } else {
+            context.startActivity(intent)
+        }
     }
     val callPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        val c = customers.firstOrNull { it.id == pendingCall }
         val prepared = pendingCallIntent
-        if (c != null && prepared != null) try {
+        if (prepared != null) try {
             if (granted) launchPendingCall(prepared)
             else {
-                message = "未授予直接拨号权限，已打开系统拨号界面，请手动确认拨出。"
-                launchPendingCall(Intent(Intent.ACTION_DIAL, prepared.data))
+                pendingCall = null
+                message = "未授予直接拨号权限，本次未拨出电话。请在系统设置中允许“直接拨打电话”后重试。"
             }
         } catch (_: Exception) {
             pendingCall = null; callLaunched = false
-            message = "无法打开拨号界面，请检查系统电话应用。"
+            message = "直接拨号失败，请检查电话权限、SIM 卡状态及系统电话服务。"
         } finally { pendingCallIntent = null }
     }
     val callLogPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -226,8 +234,12 @@ private fun NovaApp(
         pendingCall = customer.id
         val prepared = buildCustomerCallIntent(customer)
         pendingCallIntent = prepared
-        if (prepared.action == Intent.ACTION_DIAL ||
-            ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) {
+        if (prepared.action == "com.example.novacustomerdialer.NO_SIM_ACCOUNT") {
+            pendingCall = null
+            pendingCallIntent = null
+            return
+        }
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) {
             try { launchPendingCall(prepared); pendingCallIntent = null }
             catch (_: Exception) { pendingCall = null; callLaunched = false; pendingCallIntent = null; message = "无法打开系统拨号界面。" }
         } else callPermissionLauncher.launch(Manifest.permission.CALL_PHONE)
@@ -627,7 +639,7 @@ private fun NovaApp(
                 Card(shape = RoundedCornerShape(16.dp)) {
                     Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("双卡拨号设置", fontWeight = FontWeight.SemiBold)
-                        Text("可选择系统默认、SIM1、SIM2或轮换。SIM 卡槽需能与 Android 通话账户匹配；识别失败时会打开系统拨号界面供你确认。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                        Text("选择 SIM1、SIM2 或按拨号轮换后，将通过 Android Telecom 指定电话账户直接发起通话，不再弹出电话卡选择界面。首次使用需授权电话账户和直接拨号权限；若 SIM 未识别会提示原因，不会擅自改用其他卡。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             FilterChip(selected = simMode == "system", onClick = { simMode = "system"; settingsPrefs.edit().putString("simMode", simMode).apply() }, label = { Text("系统默认") })
                             FilterChip(selected = simMode == "sim1", onClick = { simMode = "sim1"; settingsPrefs.edit().putString("simMode", simMode).apply() }, label = { Text("SIM1") })
@@ -640,7 +652,7 @@ private fun NovaApp(
                             OutlinedButton(onClick = { phoneStatePermissionLauncher.launch(Manifest.permission.READ_PHONE_STATE) }, modifier = Modifier.fillMaxWidth()) {
                                 Text("授权读取电话账户")
                             }
-                        } else Text("电话账户权限已授权；拨号时将尝试按卡槽匹配 SIM。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                        } else Text("电话账户权限已授权；指定 SIM 后将直接发起通话。系统还会在首次拨号时请求直接拨号权限。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
                     }
                 }
 
@@ -833,10 +845,11 @@ private fun HomeScreen(
 }
 @Composable private fun EmptyCard(title: String, subtitle: String) { Card(shape = RoundedCornerShape(18.dp)) { Column(Modifier.fillMaxWidth().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) { Text(title, fontWeight = FontWeight.Bold); Text(subtitle, color = Color(0xFF64748B)) } } }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable private fun CustomerEditor(initial: Customer?, tags: List<CustomerTag>, onDismiss: () -> Unit, onSave: (Customer) -> Unit, onDelete: (Customer) -> Unit, onCreateTag: (String) -> Unit) {
     val context = LocalContext.current
     var name by remember(initial?.id) { mutableStateOf(initial?.name.orEmpty()) }; var phone by remember(initial?.id) { mutableStateOf(initial?.phone.orEmpty()) }; var company by remember(initial?.id) { mutableStateOf(initial?.company.orEmpty()) }; var note by remember(initial?.id) { mutableStateOf(initial?.note.orEmpty()) }; var status by remember(initial?.id) { mutableStateOf(initial?.status ?: "待联系") }; var followUp by remember(initial?.id) { mutableStateOf(initial?.followUp.orEmpty()) }; var chosen by remember(initial?.id) { mutableStateOf(initial?.tags?.toSet() ?: emptySet()) }; var error by remember { mutableStateOf("") }; var statusMenu by remember { mutableStateOf(false) }; var newTag by remember { mutableStateOf("") }
-    AlertDialog(onDismissRequest = onDismiss, title = { Text(if (initial == null) "新增客户" else "编辑客户") }, text = { Column(Modifier.heightIn(max = 540.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+    AlertDialog(onDismissRequest = onDismiss, title = { Text(if (initial == null) "新增客户" else "编辑客户") }, text = { Column(Modifier.fillMaxWidth().heightIn(max = 540.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(7.dp)) {
         OutlinedTextField(name, { name = it }, label = { Text("姓名 *") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
         OutlinedTextField(phone, { phone = it }, label = { Text("电话 *") }, modifier = Modifier.fillMaxWidth(), singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone))
         OutlinedTextField(company, { company = it }, label = { Text("单位名称") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
@@ -865,18 +878,30 @@ private fun HomeScreen(
         Text("打开日期选择器时，默认选中明天；也可以改选其他日期。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
         OutlinedTextField(note, { note = it }, label = { Text("备注 / 沟通情况") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
         Text("客户标签（可多选）", fontWeight = FontWeight.SemiBold)
-        tags.forEach { t -> FilterChip(selected = t.name in chosen, onClick = { chosen = if (t.name in chosen) chosen - t.name else chosen + t.name }, label = { Text(t.name) }, leadingIcon = { Box(Modifier.size(9.dp).background(Color(t.color), RoundedCornerShape(50))) }) }
-        Row(verticalAlignment = Alignment.CenterVertically) { OutlinedTextField(newTag, { newTag = it }, modifier = Modifier.weight(1f), label = { Text("新建标签") }, singleLine = true); TextButton(onClick = { if (newTag.isNotBlank()) { onCreateTag(newTag.trim()); chosen = chosen + newTag.trim(); newTag = "" } }) { Text("添加") } }
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            tags.forEach { t -> FilterChip(selected = t.name in chosen, onClick = { chosen = if (t.name in chosen) chosen - t.name else chosen + t.name }, label = { Text(t.name) }, leadingIcon = { Box(Modifier.size(9.dp).background(Color(t.color), RoundedCornerShape(50))) }) }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            OutlinedTextField(newTag, { newTag = it }, modifier = Modifier.weight(1f), label = { Text("新建标签") }, singleLine = true)
+            TextButton(onClick = { if (newTag.isNotBlank()) { onCreateTag(newTag.trim()); chosen = chosen + newTag.trim(); newTag = "" } }, modifier = Modifier.widthIn(min = 64.dp)) { Text("添加", maxLines = 1) }
+        }
         if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error)
     } }, confirmButton = { Button(onClick = { if (name.isBlank() || phone.isBlank()) error = "姓名和电话不能为空。" else onSave((initial ?: Customer(name = name.trim(), phone = phone.trim())).copy(name = name.trim(), phone = phone.trim(), company = company.trim(), note = note.trim(), status = status, followUp = followUp.trim(), tags = chosen.toList())) }) { Text("保存") } }, dismissButton = { Row { if (initial != null) TextButton(onClick = { onDelete(initial) }) { Text("删除") }; TextButton(onClick = onDismiss) { Text("取消") } } })
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable private fun TagEditor(initial: CustomerTag?, onDismiss: () -> Unit, onSave: (CustomerTag) -> Unit) {
     var name by remember(initial?.name) { mutableStateOf(initial?.name.orEmpty()) }; var color by remember(initial?.name) { mutableLongStateOf(initial?.color ?: palette[0]) }; var error by remember { mutableStateOf("") }
     AlertDialog(onDismissRequest = onDismiss, title = { Text(if (initial == null) "新建标签" else "编辑标签") }, text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         OutlinedTextField(name, { name = it }, label = { Text("标签名称") }, singleLine = true)
         Text("选择标签颜色")
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { palette.forEach { p -> Box(Modifier.size(30.dp).background(Color(p), RoundedCornerShape(50)).clickable { color = p }, contentAlignment = Alignment.Center) { if (color == p) Text("✓", color = Color.White) } } }
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            palette.forEach { p ->
+                Box(Modifier.size(34.dp).background(Color(p), RoundedCornerShape(50)).clickable { color = p }, contentAlignment = Alignment.Center) {
+                    if (color == p) Text("✓", color = Color.White)
+                }
+            }
+        }
         if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error)
     } }, confirmButton = { Button(onClick = { if (name.isBlank()) error = "请输入标签名称。" else onSave(CustomerTag(name.trim(), color)) }) { Text("保存") } }, dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } })
 }
