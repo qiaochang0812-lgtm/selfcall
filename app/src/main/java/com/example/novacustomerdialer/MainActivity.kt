@@ -43,6 +43,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -76,12 +78,55 @@ private enum class Page { HOME, CUSTOMERS, DIALER, SETTINGS, STATS, TAGS }
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { MaterialTheme(colorScheme = lightColorScheme(primary = Color(0xFF5879A8), secondary = Color(0xFF6B9487), background = Color(0xFFF7F8FA), surface = Color.White, surfaceVariant = Color(0xFFF0F2F5))) { NovaApp() } }
+        setContent {
+            val prefs = getSharedPreferences("nova_settings", MODE_PRIVATE)
+            var themeColor by remember {
+                mutableIntStateOf(prefs.getInt("themeColor", 0xFF5879A8.toInt()))
+            }
+            var fontScale by remember {
+                mutableFloatStateOf(prefs.getFloat("fontScale", 1.0f))
+            }
+            val systemDensity = LocalDensity.current
+            CompositionLocalProvider(
+                LocalDensity provides Density(
+                    systemDensity.density,
+                    systemDensity.fontScale * fontScale
+                )
+            ) {
+                MaterialTheme(
+                    colorScheme = lightColorScheme(
+                        primary = Color(themeColor),
+                        secondary = Color(0xFF6B9487),
+                        background = Color(0xFFF7F8FA),
+                        surface = Color.White,
+                        surfaceVariant = Color(0xFFF0F2F5)
+                    )
+                ) {
+                    NovaApp(
+                        themeColor = themeColor,
+                        fontScale = fontScale,
+                        onThemeColorChange = { color ->
+                            themeColor = color
+                            prefs.edit().putInt("themeColor", color).apply()
+                        },
+                        onFontScaleChange = { scale ->
+                            fontScale = scale
+                            prefs.edit().putFloat("fontScale", scale).apply()
+                        }
+                    )
+                }
+            }
+        }
     }
 }
 
 @Composable
-private fun NovaApp() {
+private fun NovaApp(
+    themeColor: Int,
+    fontScale: Float,
+    onThemeColorChange: (Int) -> Unit,
+    onFontScaleChange: (Float) -> Unit
+) {
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current
     var customers by remember { mutableStateOf(loadCustomers(context)) }
@@ -381,6 +426,64 @@ private fun NovaApp() {
                     fontWeight = FontWeight.SemiBold)
                 Text("管理客户分类、查看沟通统计和维护客户数据。",
                     color = Color(0xFF64748B))
+                Card(shape = RoundedCornerShape(16.dp)) {
+                    Column(
+                        Modifier.fillMaxWidth().padding(18.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text("外观设置", fontWeight = FontWeight.SemiBold)
+                        Text("字体大小", color = Color(0xFF64748B))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf(
+                                0.8f to "小",
+                                1.0f to "标准",
+                                1.2f to "大"
+                            ).forEach { (scale, label) ->
+                                FilterChip(
+                                    selected = fontScale == scale,
+                                    onClick = { onFontScaleChange(scale) },
+                                    label = { Text(label) }
+                                )
+                            }
+                        }
+                        Text("主题颜色", color = Color(0xFF64748B))
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(14.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            listOf(
+                                0xFF5879A8.toInt(),
+                                0xFF39856B.toInt(),
+                                0xFF8064A8.toInt(),
+                                0xFFC47A36.toInt(),
+                                0xFF318C9A.toInt()
+                            ).forEach { color ->
+                                Box(
+                                    Modifier
+                                        .size(34.dp)
+                                        .background(Color(color), RoundedCornerShape(50))
+                                        .clickable { onThemeColorChange(color) },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (themeColor == color) {
+                                        Icon(
+                                            Icons.Filled.CheckCircle,
+                                            contentDescription = "当前主题",
+                                            tint = Color.White
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        Text(
+                            "选择后立即生效，并自动保存在本机。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color(0xFF64748B)
+                        )
+                    }
+                }
+
 
                 Card(
                     onClick = { page = Page.TAGS },
