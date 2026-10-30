@@ -12,8 +12,8 @@ android {
         applicationId = "com.example.novacustomerdialer"
         minSdk = 26
         targetSdk = 35
-        versionCode = 9
-        versionName = "0.7.0"
+        versionCode = 10
+        versionName = "0.8.0"
     }
 
     compileOptions {
@@ -36,6 +36,12 @@ android {
     }
 
     buildTypes {
+        getByName("debug") {
+            if (providers.gradleProperty("standaloneDebug").orNull != "true") {
+                applicationIdSuffix = ".debug"
+                versionNameSuffix = "-debug"
+            }
+        }
         getByName("release") {
             signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = false
