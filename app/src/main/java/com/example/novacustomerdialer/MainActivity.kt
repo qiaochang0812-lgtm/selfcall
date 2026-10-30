@@ -3,13 +3,16 @@ package com.example.novacustomerdialer
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.provider.Settings as AndroidSettings
 import android.provider.CallLog
+import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
 import android.telephony.SubscriptionManager
 import android.app.DatePickerDialog
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -39,6 +42,8 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.FileDownload
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
@@ -46,6 +51,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
@@ -78,6 +85,25 @@ data class Customer(
 )
 data class CustomerTag(val name: String, val color: Long = palette[0])
 private enum class Page { HOME, CUSTOMERS, DIALER, SETTINGS, STATS, TAGS }
+
+private data class SimCallOption(
+    val slotIndex: Int,
+    val subscriptionId: Int,
+    val displayName: String,
+    val carrierName: String,
+    val account: PhoneAccountHandle?,
+    val matchMethod: String
+) {
+    val title: String get() = "SIM${slotIndex + 1}"
+    val network: String get() = displayName.ifBlank { carrierName }.ifBlank { "已识别 SIM" }
+}
+
+private data class PreparedCustomerCall(
+    val intent: Intent,
+    val account: PhoneAccountHandle?,
+    val simSlotIndex: Int?,
+    val simLabel: String
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -124,6 +150,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun NovaApp(
     themeColor: Int,
@@ -152,11 +179,16 @@ private fun NovaApp(
     var callLogPermissionGranted by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED) }
     var callLogRefresh by remember { mutableIntStateOf(0) }
     var phoneStateGranted by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED) }
+    var callPermissionGranted by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) }
     var showBulkTagMenu by remember { mutableStateOf(false) }
     val settingsPrefs = remember { context.getSharedPreferences("nova_settings", Context.MODE_PRIVATE) }
     var simMode by remember { mutableStateOf(settingsPrefs.getString("simMode", "system") ?: "system") }
-    var simRotationIndex by remember { mutableIntStateOf(settingsPrefs.getInt("simRotationIndex", 0)) }
-    var pendingCallIntent by remember { mutableStateOf<Intent?>(null) }
+    var rotationSlot by remember { mutableIntStateOf(settingsPrefs.getInt("simRotationSlot", settingsPrefs.getInt("simRotationIndex", 0)).coerceIn(0, 1)) }
+    var rotationUsed by remember { mutableIntStateOf(settingsPrefs.getInt("simRotationUsed", 0).coerceAtLeast(0)) }
+    var rotationCallsPerSim by remember { mutableIntStateOf(settingsPrefs.getInt("simRotationCallsPerSim", 1).coerceIn(1, 99)) }
+    var simRefresh by remember { mutableIntStateOf(0) }
+    var permissionsRefresh by remember { mutableIntStateOf(0) }
+    var pendingCallRequest by remember { mutableStateOf<PreparedCustomerCall?>(null) }
     var outcome by remember { mutableStateOf("已接通") }
     var outcomeNote by remember { mutableStateOf("") }
     var outcomeDate by remember { mutableStateOf("") }
@@ -169,88 +201,163 @@ private fun NovaApp(
     var showCustomerStatusMenu by remember { mutableStateOf(false) }
     var showDialerStatusMenu by remember { mutableStateOf(false) }
     var statsPeriod by remember { mutableStateOf("当天统计") }
+    val availableSims = remember(phoneStateGranted, simRefresh, permissionsRefresh) {
+        if (phoneStateGranted) activeSimCallOptions(context) else emptyList()
+    }
 
     fun saveCustomers(value: List<Customer>) { customers = value; persistCustomers(context, value); if (value.none { it.id == currentId }) currentId = value.firstOrNull()?.id; selected = selected.intersect(value.map { it.id }.toSet()) }
     fun saveTags(value: List<CustomerTag>) { tags = value; persistTags(context, value) }
 
     val phoneStatePermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         phoneStateGranted = granted
+        simRefresh++
         if (!granted) {
             simMode = "system"
             settingsPrefs.edit().putString("simMode", "system").apply()
             message = "未授权读取电话账户，已切回系统默认拨号方式。"
-        } else message = "电话账户权限已授权，可尝试指定 SIM 卡。"
+        } else {
+            message = "电话权限已授权，正在读取 SIM 卡和通话账户。"
+        }
     }
-    fun buildCustomerCallIntent(customer: Customer): Intent {
+    fun chooseRotationSlot(): Int? {
+        val sims = activeSimCallOptions(context).filter { it.account != null }
+        if (sims.isEmpty()) return null
+        return sims.firstOrNull { it.slotIndex == rotationSlot }?.slotIndex
+            ?: sims.firstOrNull()?.slotIndex
+    }
+    fun prepareCustomerCall(customer: Customer): PreparedCustomerCall? {
         val uri = Uri.parse("tel:${Uri.encode(customer.phone)}")
-        if (simMode == "system") return Intent(Intent.ACTION_CALL, uri)
-        val slots = when (simMode) {
-            "sim1" -> listOf(0)
-            "sim2" -> listOf(1)
-            "rotate" -> {
-                val first = if (simRotationIndex % 2 == 0) 0 else 1
-                simRotationIndex = (simRotationIndex + 1) % 2
-                settingsPrefs.edit().putInt("simRotationIndex", simRotationIndex).apply()
-                listOf(first, 1 - first)
-            }
-            else -> emptyList()
+        if (simMode == "system") {
+            return PreparedCustomerCall(Intent(Intent.ACTION_CALL, uri), null, null, "系统默认卡")
         }
-        val account = slots.firstNotNullOfOrNull { slot -> phoneAccountForSlot(context, slot) }
+        if (!phoneStateGranted) {
+            message = "指定 SIM 拨号需要“电话状态”权限，请先完成下方权限授权。"
+            return null
+        }
+        val requestedSlot = when (simMode) {
+            "sim1" -> 0
+            "sim2" -> 1
+            "rotate" -> chooseRotationSlot()
+            else -> null
+        }
+        if (requestedSlot == null) {
+            message = "当前没有可用的语音 SIM，请检查 SIM 是否启用语音服务。"
+            return null
+        }
+        val sims = activeSimCallOptions(context)
+        val sim = sims.firstOrNull { it.slotIndex == requestedSlot }
+        if (sim == null) {
+            message = "未检测到 SIM${requestedSlot + 1}。请确认卡槽已插卡并在系统中启用。"
+            return null
+        }
+        val account = sim.account
         if (account == null) {
-            message = "未识别到所选 SIM 的通话账户。请授权读取电话账户，并确认该 SIM 已启用语音通话；本次不会改用其他卡或跳转拨号盘。"
-            return Intent("com.example.novacustomerdialer.NO_SIM_ACCOUNT", uri)
+            val detected = sims.joinToString("、") { "${it.title} ${it.network}" }.ifBlank { "无" }
+            message = "SIM${requestedSlot + 1} 已识别为 ${sim.network}，但系统未返回对应通话账户。已检测：$detected。请确认该卡已启用语音通话。"
+            Log.w("NovaDialer", "No Telecom account for slot=$requestedSlot; detected=$detected")
+            return null
         }
-        return Intent(Intent.ACTION_CALL, uri).putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, account)
+        val intent = Intent(Intent.ACTION_CALL, uri).putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, account)
+        return PreparedCustomerCall(intent, account, requestedSlot, "${sim.title} · ${sim.network}")
     }
-    fun launchPendingCall(intent: Intent) {
-        callLaunched = true
-        val account = intent.getParcelableExtra<android.telecom.PhoneAccountHandle>(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE)
+    fun commitRotationAfterCall(prepared: PreparedCustomerCall) {
+        val actualSlot = prepared.simSlotIndex ?: return
+        if (simMode != "rotate") return
+        var nextUsed = rotationUsed + 1
+        var nextSlot = rotationSlot
+        if (nextUsed >= rotationCallsPerSim) {
+            nextUsed = 0
+            nextSlot = 1 - actualSlot.coerceIn(0, 1)
+        } else {
+            nextSlot = actualSlot
+        }
+        rotationUsed = nextUsed
+        rotationSlot = nextSlot
+        settingsPrefs.edit()
+            .putInt("simRotationUsed", nextUsed)
+            .putInt("simRotationSlot", nextSlot)
+            .putInt("simRotationIndex", nextSlot)
+            .apply()
+    }
+    fun launchPreparedCall(prepared: PreparedCustomerCall) {
+        val account = prepared.account
         if (account != null) {
             val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
             val extras = Bundle().apply { putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, account) }
-            telecom.placeCall(intent.data ?: error("缺少电话号码"), extras)
+            telecom.placeCall(prepared.intent.data ?: error("缺少电话号码"), extras)
         } else {
-            context.startActivity(intent)
+            context.startActivity(prepared.intent)
         }
+        callLaunched = true
+        commitRotationAfterCall(prepared)
+        message = "正在通过 ${prepared.simLabel} 拨出。"
     }
     val callPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        val prepared = pendingCallIntent
+        callPermissionGranted = granted
+        val prepared = pendingCallRequest
         if (prepared != null) try {
-            if (granted) launchPendingCall(prepared)
+            if (granted) launchPreparedCall(prepared)
             else {
                 pendingCall = null
-                message = "未授予直接拨号权限，本次未拨出电话。请在系统设置中允许“直接拨打电话”后重试。"
+                message = "未授予“直接拨打电话”权限，本次未拨出。可在下方权限栏目中授权后重试。"
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             pendingCall = null; callLaunched = false
-            message = "直接拨号失败，请检查电话权限、SIM 卡状态及系统电话服务。"
-        } finally { pendingCallIntent = null }
+            message = "直接拨号失败：${e.message ?: "请检查 SIM 状态及系统电话服务"}"
+            Log.e("NovaDialer", "Direct call failed for ${prepared.simLabel}", e)
+        } finally { pendingCallRequest = null }
     }
     val callLogPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         callLogPermissionGranted = granted
         if (granted) callLogRefresh++ else message = "未授权读取通话记录，统计页将不显示系统通话数据。"
     }
+    val allPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        callPermissionGranted = result[Manifest.permission.CALL_PHONE]
+            ?: (ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED)
+        phoneStateGranted = result[Manifest.permission.READ_PHONE_STATE]
+            ?: (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED)
+        callLogPermissionGranted = result[Manifest.permission.READ_CALL_LOG]
+            ?: (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED)
+        permissionsRefresh++
+        simRefresh++
+        if (callPermissionGranted && phoneStateGranted) {
+            message = "拨号与 SIM 权限已就绪。通话记录权限可选，用于统计。"
+        } else {
+            message = "权限尚未全部授权；指定 SIM 拨号至少需要“电话”和“电话状态”权限。"
+        }
+    }
     fun startCustomerCall(customer: Customer) {
         pendingCall = customer.id
-        val prepared = buildCustomerCallIntent(customer)
-        pendingCallIntent = prepared
-        if (prepared.action == "com.example.novacustomerdialer.NO_SIM_ACCOUNT") {
+        val prepared = prepareCustomerCall(customer)
+        if (prepared == null) {
             pendingCall = null
-            pendingCallIntent = null
+            pendingCallRequest = null
             return
         }
+        pendingCallRequest = prepared
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) {
-            try { launchPendingCall(prepared); pendingCallIntent = null }
-            catch (_: Exception) { pendingCall = null; callLaunched = false; pendingCallIntent = null; message = "无法打开系统拨号界面。" }
+            try { launchPreparedCall(prepared); pendingCallRequest = null }
+            catch (e: Exception) {
+                pendingCall = null; callLaunched = false; pendingCallRequest = null
+                message = "直接拨号失败：${e.message ?: "请检查电话权限及 SIM 状态"}"
+                Log.e("NovaDialer", "Direct call failed for ${prepared.simLabel}", e)
+            }
         } else callPermissionLauncher.launch(Manifest.permission.CALL_PHONE)
     }
 
-    DisposableEffect(lifecycle, pendingCall) {
+    DisposableEffect(lifecycle, pendingCall, callLaunched) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME && pendingCall != null && callLaunched) {
-                callLaunched = false; callLogRefresh++
-                val c = customers.firstOrNull { it.id == pendingCall }
-                if (c != null) { outcome = c.status.takeIf { it != "待联系" } ?: "已接通"; outcomeNote = ""; outcomeDate = c.followUp; outcomeTags = c.tags.toSet(); showOutcome = true }
+            if (event == Lifecycle.Event.ON_RESUME) {
+                callPermissionGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
+                phoneStateGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED
+                callLogPermissionGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED
+                permissionsRefresh++
+                simRefresh++
+                if (pendingCall != null && callLaunched) {
+                    callLaunched = false; callLogRefresh++
+                    val c = customers.firstOrNull { it.id == pendingCall }
+                    if (c != null) { outcome = c.status.takeIf { it != "待联系" } ?: "已接通"; outcomeNote = ""; outcomeDate = c.followUp; outcomeTags = c.tags.toSet(); showOutcome = true }
+                }
             }
         }
         lifecycle.lifecycle.addObserver(observer)
@@ -268,6 +375,10 @@ private fun NovaApp(
             val parsed = rowsToCustomers(rows)
             val seen = customers.map { digits(it.phone) }.toMutableSet()
             val fresh = parsed.filter { digits(it.phone).isNotBlank() && seen.add(digits(it.phone)) }
+            val importedTagNames = fresh.flatMap { it.tags }.distinct().filter { name -> tags.none { it.name == name } }
+            if (importedTagNames.isNotEmpty()) {
+                saveTags(tags + importedTagNames.mapIndexed { index, name -> CustomerTag(name, palette[(tags.size + index) % palette.size]) })
+            }
             saveCustomers(customers + fresh); message = "识别 ${parsed.size} 条，新增 ${fresh.size} 条，重复号码已跳过。"
         } catch (e: Exception) { message = "导入失败：${e.message ?: "请检查文件格式"}" }
     }
@@ -275,8 +386,8 @@ private fun NovaApp(
         if (uri != null) try {
             val exportList = if (selected.isNotEmpty()) customers.filter { it.id in selected } else customers
             val csv = buildString {
-                append("姓名,手机号,单位名称,状态,备注情况,下次回访日期,标签\r\n")
-                exportList.forEach { c -> append(listOf(c.name,c.phone,c.company,c.status,c.note,c.followUp,c.tags.joinToString("|" )).joinToString(",") { csvEscape(it) }); append("\r\n") }
+                append("姓名,手机号,单位名称,状态,备注情况,下次回访日期,标签,最后沟通\r\n")
+                exportList.forEach { c -> append(listOf(c.name,c.phone,c.company,c.status,c.note,c.followUp,c.tags.joinToString("|"),c.lastContactAt).joinToString(",") { csvEscape(it) }); append("\r\n") }
             }
             context.contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use { it.write("\uFEFF$csv") }
             message = "已导出 ${exportList.size} 位客户。"
@@ -315,18 +426,49 @@ private fun NovaApp(
         }
     }
 
+    val snackbarHostState = remember { SnackbarHostState() }
+    LaunchedEffect(message) {
+        if (message.isNotBlank()) snackbarHostState.showSnackbar(message)
+    }
+
     Scaffold(
         topBar = {
-            Surface(shadowElevation = 2.dp, color = Color.White) {
-                Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
-                    if (page != Page.HOME) TextButton(onClick = { page = Page.HOME }) { Text("‹") }
-                    Column(Modifier.weight(1f)) {
-                        Text(when(page) { Page.HOME -> "沟通无限"; Page.CUSTOMERS -> "客户管理"; Page.DIALER -> "连续拨号"; Page.SETTINGS -> "设置"; Page.STATS -> "统计报表"; Page.TAGS -> "标签管理" }, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                        Text(when(page) { Page.HOME -> "高效沟通 · 客户无限"; Page.CUSTOMERS -> "搜索 · 分类 · 批量管理"; Page.DIALER -> "拨打后记录结果，继续下一位"; Page.SETTINGS -> "标签、统计与数据管理"; Page.STATS -> "当天与当月跟进情况"; Page.TAGS -> "按业务需要定义客户分类" }, style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+            Surface(shadowElevation = 1.dp, color = Color.White) {
+                Box(
+                    Modifier.fillMaxWidth().background(
+                        Brush.verticalGradient(listOf(Color.White, MaterialTheme.colorScheme.primary.copy(alpha = 0.045f)))
+                    )
+                ) {
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (page != Page.HOME) {
+                            IconButton(onClick = { page = Page.HOME }) {
+                                Icon(Icons.Filled.ArrowBack, contentDescription = "返回首页")
+                            }
+                        }
+                        Surface(shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)) {
+                            Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
+                                Icon(
+                                    when (page) {
+                                        Page.HOME -> Icons.Filled.Home
+                                        Page.CUSTOMERS, Page.TAGS -> Icons.Filled.People
+                                        Page.DIALER -> Icons.Filled.Call
+                                        Page.STATS -> Icons.Filled.BarChart
+                                        Page.SETTINGS -> Icons.Filled.Settings
+                                    },
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                        }
+                        Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                            Text(when(page) { Page.HOME -> "沟通无限"; Page.CUSTOMERS -> "客户管理"; Page.DIALER -> "连续拨号"; Page.SETTINGS -> "设置"; Page.STATS -> "统计报表"; Page.TAGS -> "标签管理" }, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                            Text(when(page) { Page.HOME -> "高效沟通 · 客户无限"; Page.CUSTOMERS -> "搜索 · 分类 · 批量管理"; Page.DIALER -> "拨打后记录结果，继续下一位"; Page.SETTINGS -> "双卡拨号、权限与数据管理"; Page.STATS -> "当天与当月跟进情况"; Page.TAGS -> "按业务需要定义客户分类" }, style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                        }
                     }
                 }
             }
         },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
             NavigationBar(containerColor = Color.White) {
                 NavigationBarItem(selected = page == Page.HOME, onClick = { page = Page.HOME }, icon = { Icon(Icons.Filled.Home, contentDescription = "首页") }, label = { Text("首页") })
@@ -442,7 +584,18 @@ private fun NovaApp(
                         }
                     }
                 }
-                Text("${if (dialerQuickFilter == "全部名单") "沟通状态筛选" else dialerQuickFilter} · ${dialerCustomers.size} 位", style = MaterialTheme.typography.bodySmall, color = Color(0xFF737D8B), maxLines = 1)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Surface(Modifier.weight(1f), shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)) {
+                        Text(
+                            "拨号线路：${dialModeDescription(simMode, availableSims, rotationSlot, rotationUsed, rotationCallsPerSim)}",
+                            Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            maxLines = 1
+                        )
+                    }
+                    Text("${if (dialerQuickFilter == "全部名单") "沟通状态筛选" else dialerQuickFilter} · ${dialerCustomers.size} 位", style = MaterialTheme.typography.bodySmall, color = Color(0xFF737D8B), maxLines = 1)
+                }
                 LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(bottom = 8.dp)) {
                     if (current != null && dialerCustomers.any { it.id == current.id }) item {
                         Card(shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = Color.White), elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)) {
@@ -479,8 +632,8 @@ private fun NovaApp(
                 }
                 if (current != null && dialerCustomers.any { it.id == current.id }) {
                     Surface(color = Color.White, shadowElevation = 2.dp) {
-                        Button(onClick = { startCustomerCall(current) }, Modifier.fillMaxWidth().navigationBarsPadding().padding(top = 8.dp, bottom = 4.dp).height(52.dp), shape = RoundedCornerShape(14.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF5879A8))) {
-                            Icon(Icons.Filled.Call, contentDescription = null); Spacer(Modifier.width(8.dp)); Text("拨打当前客户", maxLines = 1, softWrap = false)
+                        Button(onClick = { startCustomerCall(current) }, Modifier.fillMaxWidth().navigationBarsPadding().padding(top = 8.dp, bottom = 4.dp).height(54.dp), shape = RoundedCornerShape(16.dp)) {
+                            Icon(Icons.Filled.Call, contentDescription = null); Spacer(Modifier.width(8.dp)); Text(if (simMode == "system") "拨打当前客户" else "一键拨打当前客户", maxLines = 1, softWrap = false)
                         }
                     }
                 }
@@ -525,147 +678,250 @@ private fun NovaApp(
                     Text("系统拨出次数和时长来自 Android 通话记录；接通以系统记录的通话时长大于 0 估算。客户沟通状态统计仍来自应用内记录。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF737D8B))
                 }
             }
-            Page.SETTINGS -> Column(
-                Modifier.fillMaxSize().padding(insets).padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Text("应用设置", style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.SemiBold)
-                Text("管理客户分类、查看沟通统计和维护客户数据。",
-                    color = Color(0xFF64748B))
-                Card(shape = RoundedCornerShape(16.dp)) {
-                    Column(
-                        Modifier.fillMaxWidth().padding(18.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        Text("外观设置", fontWeight = FontWeight.SemiBold)
-                        Text("字体大小", color = Color(0xFF64748B))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            listOf(
-                                0.8f to "小",
-                                1.0f to "标准",
-                                1.2f to "大"
-                            ).forEach { (scale, label) ->
-                                FilterChip(
-                                    selected = fontScale == scale,
-                                    onClick = { onFontScaleChange(scale) },
-                                    label = { Text(label) }
-                                )
+            Page.SETTINGS -> {
+                fun applySimMode(mode: String) {
+                    simMode = mode
+                    rotationSlot = 0
+                    rotationUsed = 0
+                    settingsPrefs.edit()
+                        .putString("simMode", mode)
+                        .putInt("simRotationSlot", 0)
+                        .putInt("simRotationIndex", 0)
+                        .putInt("simRotationUsed", 0)
+                        .apply()
+                    simRefresh++
+                    if (mode != "system" && !phoneStateGranted) {
+                        phoneStatePermissionLauncher.launch(Manifest.permission.READ_PHONE_STATE)
+                    }
+                }
+                fun openAppPermissionSettings() {
+                    try {
+                        context.startActivity(
+                            Intent(AndroidSettings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))
+                        )
+                    } catch (_: Exception) {
+                        message = "无法打开系统应用设置，请从系统设置的应用管理中调整权限。"
+                    }
+                }
+
+                LazyColumn(
+                    Modifier.fillMaxSize().padding(insets),
+                    contentPadding = PaddingValues(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    item {
+                        Card(
+                            shape = RoundedCornerShape(24.dp),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.09f))
+                        ) {
+                            Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.primary) {
+                                    Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                                        Icon(Icons.Filled.Call, contentDescription = null, tint = Color.White)
+                                    }
+                                }
+                                Column(Modifier.weight(1f).padding(start = 14.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                    Text("拨号偏好", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                                    Text("选择线路后，点“一键拨打”立即呼叫当前客户。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF5F6C7E))
+                                }
                             }
                         }
-                        Text("主题颜色", color = Color(0xFF64748B))
-                        Row(
-                            Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(14.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            listOf(
-                                0xFF5879A8.toInt(),
-                                0xFF39856B.toInt(),
-                                0xFF8064A8.toInt(),
-                                0xFFC47A36.toInt(),
-                                0xFF318C9A.toInt()
-                            ).forEach { color ->
-                                Box(
-                                    Modifier
-                                        .size(34.dp)
-                                        .background(Color(color), RoundedCornerShape(50))
-                                        .clickable { onThemeColorChange(color) },
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    if (themeColor == color) {
-                                        Icon(
-                                            Icons.Filled.CheckCircle,
-                                            contentDescription = "当前主题",
-                                            tint = Color.White
+                    }
+
+                    item {
+                        Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                            Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(13.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text("双卡直拨", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                                        Text("通过 Android Telecom 指定账户，不弹出选卡窗口", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                                    }
+                                    StatusPill(
+                                        text = if (phoneStateGranted) "${availableSims.count { it.account != null }}/${availableSims.size} 卡可拨" else "待授权",
+                                        active = phoneStateGranted && availableSims.any { it.account != null }
+                                    )
+                                }
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    val sim1 = availableSims.firstOrNull { it.slotIndex == 0 }
+                                    val sim2 = availableSims.firstOrNull { it.slotIndex == 1 }
+                                    FilterChip(selected = simMode == "system", onClick = { applySimMode("system") }, label = { Text("系统默认") })
+                                    FilterChip(selected = simMode == "sim1", onClick = { applySimMode("sim1") }, label = { Text("SIM1${sim1?.network?.let { " · $it" }.orEmpty()}") })
+                                    FilterChip(selected = simMode == "sim2", onClick = { applySimMode("sim2") }, label = { Text("SIM2${sim2?.network?.let { " · $it" }.orEmpty()}") })
+                                    FilterChip(selected = simMode == "rotate", onClick = { applySimMode("rotate") }, label = { Text("按拨号轮换") })
+                                }
+                                if (phoneStateGranted && availableSims.isEmpty()) {
+                                    InlineNotice("系统未返回活动 SIM 信息。请确认两张卡都已启用，再点“重新检测”。")
+                                }
+                                if (availableSims.any { it.account == null }) {
+                                    InlineNotice("部分 SIM 未返回通话账户。请确认该卡已启用“语音通话”，必要时重试检测。")
+                                }
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        if (simMode == "system") "当前：使用系统默认拨号卡" else "当前：${dialModeDescription(simMode, availableSims, rotationSlot, rotationUsed, rotationCallsPerSim)}",
+                                        Modifier.weight(1f),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    TextButton(onClick = {
+                                        phoneStateGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED
+                                        simRefresh++
+                                        message = if (phoneStateGranted) "已重新检测 SIM 卡。" else "请先授权“电话状态”权限。"
+                                    }) { Text("重新检测") }
+                                }
+                            }
+                        }
+                    }
+
+                    if (simMode == "rotate") {
+                        item {
+                            Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F9FC))) {
+                                Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                    Text("轮换规则", fontWeight = FontWeight.Bold)
+                                    Text("同一张卡连续拨出指定次数后，自动切换另一张卡。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        listOf(1, 2, 3, 5, 10).forEach { count ->
+                                            FilterChip(
+                                                selected = rotationCallsPerSim == count,
+                                                onClick = {
+                                                    rotationCallsPerSim = count
+                                                    rotationSlot = 0
+                                                    rotationUsed = 0
+                                                    settingsPrefs.edit()
+                                                        .putInt("simRotationCallsPerSim", count)
+                                                        .putInt("simRotationSlot", 0)
+                                                        .putInt("simRotationUsed", 0)
+                                                        .apply()
+                                                },
+                                                label = { Text("每卡 $count 次") }
+                                            )
+                                        }
+                                    }
+                                    Surface(shape = RoundedCornerShape(12.dp), color = Color.White) {
+                                        Text(
+                                            "下一次：SIM${rotationSlot + 1} · 本卡已拨 $rotationUsed/$rotationCallsPerSim 次",
+                                            Modifier.fillMaxWidth().padding(12.dp),
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Medium,
+                                            color = MaterialTheme.colorScheme.primary
                                         )
                                     }
                                 }
                             }
                         }
-                        Text(
-                            "选择后立即生效，并自动保存在本机。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Color(0xFF64748B)
-                        )
                     }
-                }
 
-
-                Card(
-                    onClick = { page = Page.TAGS },
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color.White)
-                ) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(18.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(Icons.Filled.People, contentDescription = null)
-                        Column(
-                            Modifier.weight(1f).padding(horizontal = 14.dp)
-                        ) {
-                            Text("客户标签", fontWeight = FontWeight.SemiBold)
-                            Text("创建、编辑标签及颜色",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color(0xFF64748B))
-                        }
-                        Icon(Icons.Filled.ChevronRight, contentDescription = null)
+                    item {
+                        Text("外观设置", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                     }
-                }
-
-                Card(
-                    onClick = { page = Page.STATS },
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color.White)
-                ) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(18.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(Icons.Filled.BarChart, contentDescription = null)
-                        Column(
-                            Modifier.weight(1f).padding(horizontal = 14.dp)
-                        ) {
-                            Text("沟通统计", fontWeight = FontWeight.SemiBold)
-                            Text("当天与当月拨出记录和跟进情况",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color(0xFF64748B))
-                        }
-                        Icon(Icons.Filled.ChevronRight, contentDescription = null)
-                    }
-                }
-
-                Card(shape = RoundedCornerShape(16.dp)) {
-                    Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("双卡拨号设置", fontWeight = FontWeight.SemiBold)
-                        Text("选择 SIM1、SIM2 或按拨号轮换后，将通过 Android Telecom 指定电话账户直接发起通话，不再弹出电话卡选择界面。首次使用需授权电话账户和直接拨号权限；若 SIM 未识别会提示原因，不会擅自改用其他卡。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            FilterChip(selected = simMode == "system", onClick = { simMode = "system"; settingsPrefs.edit().putString("simMode", simMode).apply() }, label = { Text("系统默认") })
-                            FilterChip(selected = simMode == "sim1", onClick = { simMode = "sim1"; settingsPrefs.edit().putString("simMode", simMode).apply() }, label = { Text("SIM1") })
-                        }
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            FilterChip(selected = simMode == "sim2", onClick = { simMode = "sim2"; settingsPrefs.edit().putString("simMode", simMode).apply() }, label = { Text("SIM2") })
-                            FilterChip(selected = simMode == "rotate", onClick = { simMode = "rotate"; settingsPrefs.edit().putString("simMode", simMode).apply() }, label = { Text("按拨号轮换") })
-                        }
-                        if (!phoneStateGranted) {
-                            OutlinedButton(onClick = { phoneStatePermissionLauncher.launch(Manifest.permission.READ_PHONE_STATE) }, modifier = Modifier.fillMaxWidth()) {
-                                Text("授权读取电话账户")
+                    item {
+                        Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                            Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                Text("字体大小", color = Color(0xFF64748B), style = MaterialTheme.typography.bodySmall)
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    listOf(0.8f to "小", 1.0f to "标准", 1.2f to "大").forEach { (scale, label) ->
+                                        FilterChip(selected = fontScale == scale, onClick = { onFontScaleChange(scale) }, label = { Text(label) })
+                                    }
+                                }
+                                Text("主题颜色", color = Color(0xFF64748B), style = MaterialTheme.typography.bodySmall)
+                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    listOf(
+                                        0xFF5879A8.toInt(), 0xFF39856B.toInt(), 0xFF8064A8.toInt(),
+                                        0xFFC47A36.toInt(), 0xFF318C9A.toInt()
+                                    ).forEach { color ->
+                                        Box(
+                                            Modifier.size(34.dp)
+                                                .background(Color(color), RoundedCornerShape(50))
+                                                .clickable { onThemeColorChange(color) },
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            if (themeColor == color) Icon(Icons.Filled.CheckCircle, contentDescription = "当前主题", tint = Color.White)
+                                        }
+                                    }
+                                }
                             }
-                        } else Text("电话账户权限已授权；指定 SIM 后将直接发起通话。系统还会在首次拨号时请求直接拨号权限。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                        }
                     }
-                }
 
-                Card(shape = RoundedCornerShape(16.dp)) {
-                    Column(
-                        Modifier.fillMaxWidth().padding(18.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Text("本机客户数据", fontWeight = FontWeight.SemiBold)
-                        Text("当前客户数量：${customers.size}")
-                        Text("请定期在客户管理页导出备份。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Color(0xFF64748B))
+                    item {
+                        Text("快捷入口", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    }
+                    item {
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            SettingsLink("客户标签", "创建、编辑标签及颜色", Icons.Filled.People) { page = Page.TAGS }
+                            SettingsLink("沟通统计", "当天与当月拨出记录和跟进情况", Icons.Filled.BarChart) { page = Page.STATS }
+                        }
+                    }
+
+                    item {
+                        Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                            Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text("本机客户数据", fontWeight = FontWeight.Bold)
+                                    Text("当前客户数量：${customers.size}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                                    Text("数据保存在本机，请定期从客户管理页导出备份。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                                }
+                                Text("${customers.size}", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                            }
+                        }
+                    }
+
+                    item {
+                        Spacer(Modifier.height(4.dp))
+                        Text("系统权限", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Text("以下为应用会调用的 Android 权限。只有前两项是 SIM 一键直拨的必需权限。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                    }
+                    item {
+                        Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                            Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Surface(shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)) {
+                                        Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
+                                            Icon(Icons.Filled.Lock, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                        }
+                                    }
+                                    Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                                        Text("权限状态", fontWeight = FontWeight.Bold)
+                                        Text("可随时在系统设置中撤销", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                                    }
+                                    OutlinedButton(onClick = {
+                                        allPermissionLauncher.launch(arrayOf(
+                                            Manifest.permission.CALL_PHONE,
+                                            Manifest.permission.READ_PHONE_STATE,
+                                            Manifest.permission.READ_CALL_LOG
+                                        ))
+                                    }) { Text("检查授权") }
+                                }
+                                HorizontalDivider(color = Color(0xFFE8ECF2))
+                                PermissionSettingRow(
+                                    title = "直接拨打电话",
+                                    permission = "android.permission.CALL_PHONE",
+                                    purpose = "按下拨号按钮后直接呼叫；必需",
+                                    granted = callPermissionGranted,
+                                    onRequest = { callPermissionLauncher.launch(Manifest.permission.CALL_PHONE) },
+                                    onManage = ::openAppPermissionSettings
+                                )
+                                HorizontalDivider(color = Color(0xFFE8ECF2))
+                                PermissionSettingRow(
+                                    title = "读取电话状态与 SIM 账户",
+                                    permission = "android.permission.READ_PHONE_STATE",
+                                    purpose = "识别 SIM1/SIM2 并指定 Telecom 通话账户；必需",
+                                    granted = phoneStateGranted,
+                                    onRequest = { phoneStatePermissionLauncher.launch(Manifest.permission.READ_PHONE_STATE) },
+                                    onManage = ::openAppPermissionSettings
+                                )
+                                HorizontalDivider(color = Color(0xFFE8ECF2))
+                                PermissionSettingRow(
+                                    title = "读取系统通话记录",
+                                    permission = "android.permission.READ_CALL_LOG",
+                                    purpose = "匹配客户最近通话并生成拨出统计；可选",
+                                    granted = callLogPermissionGranted,
+                                    onRequest = { callLogPermissionLauncher.launch(Manifest.permission.READ_CALL_LOG) },
+                                    onManage = ::openAppPermissionSettings
+                                )
+                                Text("应用不申请通讯录、短信、定位或网络权限。客户名单由你选择的本地文件导入。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                            }
+                        }
                     }
                 }
             }
@@ -906,16 +1162,169 @@ private fun HomeScreen(
     } }, confirmButton = { Button(onClick = { if (name.isBlank()) error = "请输入标签名称。" else onSave(CustomerTag(name.trim(), color)) }) { Text("保存") } }, dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } })
 }
 
+@Composable
+private fun StatusPill(text: String, active: Boolean) {
+    val background = if (active) Color(0xFFE6F4EE) else Color(0xFFFFF1E4)
+    val foreground = if (active) Color(0xFF247257) else Color(0xFF9A5B20)
+    Surface(shape = RoundedCornerShape(50), color = background) {
+        Text(text, Modifier.padding(horizontal = 10.dp, vertical = 5.dp), style = MaterialTheme.typography.labelSmall, color = foreground, fontWeight = FontWeight.Medium)
+    }
+}
+
+@Composable
+private fun InlineNotice(text: String) {
+    Surface(shape = RoundedCornerShape(12.dp), color = Color(0xFFFFF5E8)) {
+        Text(text, Modifier.fillMaxWidth().padding(11.dp), style = MaterialTheme.typography.bodySmall, color = Color(0xFF8A5A21))
+    }
+}
+
+@Composable
+private fun SettingsLink(title: String, subtitle: String, icon: ImageVector, onClick: () -> Unit) {
+    Card(
+        onClick = onClick,
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+    ) {
+        Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Surface(shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)) {
+                Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
+                    Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                }
+            }
+            Column(Modifier.weight(1f).padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(title, fontWeight = FontWeight.SemiBold)
+                Text(subtitle, style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+            }
+            Icon(Icons.Filled.ChevronRight, contentDescription = null, tint = Color(0xFF8290A3))
+        }
+    }
+}
+
+@Composable
+private fun PermissionSettingRow(
+    title: String,
+    permission: String,
+    purpose: String,
+    granted: Boolean,
+    onRequest: () -> Unit,
+    onManage: () -> Unit
+) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            Modifier.size(10.dp).background(
+                if (granted) Color(0xFF3A9B72) else Color(0xFFE09A45),
+                RoundedCornerShape(50)
+            )
+        )
+        Column(Modifier.weight(1f).padding(horizontal = 10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(title, fontWeight = FontWeight.SemiBold)
+            Text(permission, style = MaterialTheme.typography.labelSmall, color = Color(0xFF8190A2))
+            Text(purpose, style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+        }
+        TextButton(onClick = if (granted) onManage else onRequest) {
+            Text(if (granted) "管理" else "授权", color = if (granted) Color(0xFF3A7F65) else MaterialTheme.colorScheme.primary)
+        }
+    }
+}
+
+private fun dialModeDescription(
+    simMode: String,
+    sims: List<SimCallOption>,
+    rotationSlot: Int,
+    rotationUsed: Int,
+    rotationCallsPerSim: Int
+): String {
+    if (simMode == "system") return "系统默认卡"
+    if (simMode == "rotate") {
+        val sim = sims.firstOrNull { it.slotIndex == rotationSlot }
+        return "SIM${rotationSlot + 1}${sim?.network?.let { " · $it" }.orEmpty()}（$rotationUsed/$rotationCallsPerSim）"
+    }
+    val slot = when (simMode) {
+        "sim1" -> 0
+        "sim2" -> 1
+        else -> return "未设置"
+    }
+    val sim = sims.firstOrNull { it.slotIndex == slot }
+    return when {
+        sim == null -> "SIM${slot + 1}（未检测到）"
+        sim.account == null -> "SIM${slot + 1} · ${sim.network}（账户未就绪）"
+        else -> "SIM${slot + 1} · ${sim.network}"
+    }
+}
+
 private data class SystemCallRecord(val number: String, val dateMillis: Long, val durationSeconds: Long, val type: Int = CallLog.Calls.OUTGOING_TYPE)
 
-private fun phoneAccountForSlot(context: Context, slotIndex: Int): android.telecom.PhoneAccountHandle? {
-    if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) return null
+private fun activeSimCallOptions(context: Context): List<SimCallOption> {
+    if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) return emptyList()
     return try {
-        val subscriptions = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as? SubscriptionManager ?: return null
-        val sub = subscriptions.activeSubscriptionInfoList?.firstOrNull { it.simSlotIndex == slotIndex } ?: return null
-        val telecom = context.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager ?: return null
-        telecom.callCapablePhoneAccounts.firstOrNull { it.id == sub.subscriptionId.toString() }
-    } catch (_: SecurityException) { null } catch (_: Exception) { null }
+        val subscriptions = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as? SubscriptionManager ?: return emptyList()
+        val telecom = context.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager ?: return emptyList()
+        val activeSubscriptions = subscriptions.activeSubscriptionInfoList.orEmpty()
+            .filter { it.simSlotIndex >= 0 }
+            .sortedBy { it.simSlotIndex }
+        if (activeSubscriptions.isEmpty()) return emptyList()
+
+        val callCapable = telecom.callCapablePhoneAccounts
+        // getPhoneAccount() can require READ_PHONE_NUMBERS on Huawei. The connection-service
+        // component identifies SIM accounts without reading or exposing the subscriber number.
+        val simAccounts = callCapable.filter { handle ->
+            val component = handle.componentName
+            component.packageName == "com.android.phone" ||
+                component.className.contains("TelephonyConnectionService", ignoreCase = true)
+        }
+        if (simAccounts.isEmpty()) {
+            Log.w("NovaDialer", "Telecom returned no phone service accounts; callCapable=${callCapable.size}")
+            return emptyList()
+        }
+        val usableAccounts = simAccounts
+
+        val assigned = mutableSetOf<PhoneAccountHandle>()
+        val resolved = activeSubscriptions.mapIndexed { index, subscription ->
+            val subId = subscription.subscriptionId
+            val exact = usableAccounts.firstOrNull { handle ->
+                handle !in assigned && handle.id == subId.toString()
+            }
+            val tokenMatch = usableAccounts.firstOrNull { handle ->
+                if (handle in assigned) return@firstOrNull false
+                val id = handle.id.orEmpty()
+                id.matches(Regex("(^|\\D)${Regex.escape(subId.toString())}(\\D|$)"))
+            }
+            // 华为等定制系统可能使用槽位号或内部 ID；只有双卡账户数量一致时才按系统排序兜底。
+            val ordinalFallback = if (usableAccounts.size == activeSubscriptions.size) {
+                usableAccounts.getOrNull(index)?.takeIf { it !in assigned }
+            } else null
+            val picked = exact ?: tokenMatch ?: ordinalFallback
+            if (picked != null) assigned.add(picked)
+            val method = when {
+                exact != null -> "subscription-id"
+                tokenMatch != null -> "id-contains-subscription"
+                ordinalFallback != null -> "system-order"
+                else -> "unmatched"
+            }
+            SimCallOption(
+                slotIndex = subscription.simSlotIndex,
+                subscriptionId = subId,
+                displayName = subscription.displayName?.toString().orEmpty(),
+                carrierName = subscription.carrierName?.toString().orEmpty(),
+                account = picked,
+                matchMethod = method
+            )
+        }
+        Log.i(
+            "NovaDialer",
+            resolved.joinToString("; ") { sim ->
+                "${sim.title} ${sim.network}: account=${sim.account != null}, match=${sim.matchMethod}"
+            }
+        )
+        resolved
+    } catch (e: SecurityException) {
+        Log.w("NovaDialer", "Unable to read SIM accounts", e)
+        emptyList()
+    } catch (e: Exception) {
+        Log.w("NovaDialer", "Unable to resolve SIM accounts", e)
+        emptyList()
+    }
 }
 
 private fun phoneMatchKey(number: String): String {
@@ -1035,6 +1444,9 @@ private fun rowsToCustomers(rows: List<List<String>>): List<Customer> {
     val addressCol = col(setOf("地址", "注册地址", "住所", "address"))
     val industryCol = col(setOf("行业", "所属行业", "industry"))
     val statusCol = col(setOf("经营状态", "企业状态", "状态", "status"))
+    val followUpCol = col(setOf("下次回访日期", "回访日期", "下次联系日期", "followup"))
+    val tagsCol = col(setOf("标签", "客户标签", "tags"))
+    val lastContactCol = col(setOf("最后沟通", "最后联系", "lastcontact", "lastcontactat"))
     val phoneCols = if (headerIndex >= 0) header.indices.filter { isPhoneHeader(header[it]) } else emptyList()
 
     fun phoneNumbers(raw: String): List<String> {
@@ -1088,6 +1500,11 @@ private fun rowsToCustomers(rows: List<List<String>>): List<Customer> {
             row.getOrNull(statusCol).orEmpty().trim().takeIf { it.isNotBlank() }?.let { details.add("经营状态：$it") }
             row.getOrNull(mc).orEmpty().trim().takeIf { it.isNotBlank() }?.let { details.add(it) }
             val note = details.joinToString("；")
+            val importedStatus = row.getOrNull(statusCol).orEmpty().trim().takeIf { it in callStatuses } ?: "待联系"
+            val importedFollowUp = row.getOrNull(followUpCol).orEmpty().trim()
+            val importedTags = row.getOrNull(tagsCol).orEmpty().split("|", ";", "；")
+                .map(String::trim).filter(String::isNotBlank).distinct()
+            val importedLastContact = row.getOrNull(lastContactCol).orEmpty().trim()
 
             // 每个电话号码生成一条客户记录；同一单位的记录保持相邻，方便连续拨号。
             return@mapIndexedNotNull numbers.map { number ->
@@ -1095,7 +1512,11 @@ private fun rowsToCustomers(rows: List<List<String>>): List<Customer> {
                     name = company,
                     phone = number,
                     company = company,
-                    note = note
+                    note = note,
+                    status = importedStatus,
+                    followUp = importedFollowUp,
+                    tags = importedTags,
+                    lastContactAt = importedLastContact
                 )
             }
         }
@@ -1113,7 +1534,23 @@ private fun rowsToCustomers(rows: List<List<String>>): List<Customer> {
             else row.indices.firstOrNull { it != phoneIndex && row[it].isNotBlank() }?.let { row[it].trim() }.orEmpty()
         val company = if (cc >= 0) row.getOrNull(cc).orEmpty().trim() else row.getOrNull(2).orEmpty().trim()
         val note = if (mc >= 0) row.getOrNull(mc).orEmpty().trim() else row.getOrNull(3).orEmpty().trim()
-        numbers.map { phone -> Customer(name = name.ifBlank { company.ifBlank { phone } }, phone = phone, company = company, note = note) }
+        val importedStatus = row.getOrNull(statusCol).orEmpty().trim().takeIf { it in callStatuses } ?: "待联系"
+        val importedFollowUp = row.getOrNull(followUpCol).orEmpty().trim()
+        val importedTags = row.getOrNull(tagsCol).orEmpty().split("|", ";", "；")
+            .map(String::trim).filter(String::isNotBlank).distinct()
+        val importedLastContact = row.getOrNull(lastContactCol).orEmpty().trim()
+        numbers.map { phone ->
+            Customer(
+                name = name.ifBlank { company.ifBlank { phone } },
+                phone = phone,
+                company = company,
+                note = note,
+                status = importedStatus,
+                followUp = importedFollowUp,
+                tags = importedTags,
+                lastContactAt = importedLastContact
+            )
+        }
     }.flatten()
 }
 private fun readXlsx(context: Context, uri: Uri): List<List<String>> {
