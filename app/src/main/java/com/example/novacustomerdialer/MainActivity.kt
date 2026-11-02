@@ -14,6 +14,8 @@ import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -68,8 +70,8 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import org.json.JSONArray
 import org.json.JSONObject
-import org.xmlpull.v1.XmlPullParser
-import org.xmlpull.v1.XmlPullParserFactory
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.text.SimpleDateFormat
@@ -99,6 +101,8 @@ private data class SimCallOption(
     val matchMethod: String
 ) {
     val title: String get() = "SIM${slotIndex + 1}"
+    /** 仅靠系统返回顺序推测出的映射不可靠，界面会提示用户核对。 */
+    val verified: Boolean get() = matchMethod != "system-order"
     val network: String get() = displayName.ifBlank { carrierName }.ifBlank { "已识别 SIM" }
 }
 
@@ -112,6 +116,10 @@ private data class PreparedCustomerCall(
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
+        )
         setContent {
             val prefs = getSharedPreferences("nova_settings", MODE_PRIVATE)
             var themeColor by remember {
@@ -179,6 +187,8 @@ private fun NovaApp(
     var showOutcome by remember { mutableStateOf(false) }
     var pendingCall by remember { mutableStateOf<String?>(null) }
     var callLaunched by remember { mutableStateOf(false) }
+    var callBackgrounded by remember { mutableStateOf(false) }
+    var launchedCall by remember { mutableStateOf<PreparedCustomerCall?>(null) }
     var showBulkStatusMenu by remember { mutableStateOf(false) }
     var callLogPermissionGranted by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED) }
     var callLogRefresh by remember { mutableIntStateOf(0) }
@@ -187,7 +197,7 @@ private fun NovaApp(
     var showBulkTagMenu by remember { mutableStateOf(false) }
     val settingsPrefs = remember { context.getSharedPreferences("nova_settings", Context.MODE_PRIVATE) }
     var simMode by remember { mutableStateOf(settingsPrefs.getString("simMode", "system") ?: "system") }
-    var rotationSlot by remember { mutableIntStateOf(settingsPrefs.getInt("simRotationSlot", settingsPrefs.getInt("simRotationIndex", 0)).coerceIn(0, 1)) }
+    var rotationSlot by remember { mutableIntStateOf(settingsPrefs.getInt("simRotationSlot", settingsPrefs.getInt("simRotationIndex", 0)).coerceAtLeast(0)) }
     var rotationUsed by remember { mutableIntStateOf(settingsPrefs.getInt("simRotationUsed", 0).coerceAtLeast(0)) }
     var rotationCallsPerSim by remember { mutableIntStateOf(settingsPrefs.getInt("simRotationCallsPerSim", 1).coerceIn(1, 99)) }
     var simRefresh by remember { mutableIntStateOf(0) }
@@ -262,18 +272,17 @@ private fun NovaApp(
             return null
         }
         val intent = Intent(Intent.ACTION_CALL, uri).putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, account)
-        return PreparedCustomerCall(intent, account, requestedSlot, "${sim.title} · ${sim.network}")
+        return PreparedCustomerCall(intent, account, requestedSlot, "${sim.title} · ${sim.network}" + if (sim.verified) "" else "（顺序推测，请核对实际拨出卡）")
     }
     fun commitRotationAfterCall(prepared: PreparedCustomerCall) {
         val actualSlot = prepared.simSlotIndex ?: return
         if (simMode != "rotate") return
         var nextUsed = rotationUsed + 1
-        var nextSlot = rotationSlot
+        var nextSlot = actualSlot
         if (nextUsed >= rotationCallsPerSim) {
             nextUsed = 0
-            nextSlot = 1 - actualSlot.coerceIn(0, 1)
-        } else {
-            nextSlot = actualSlot
+            val slots = activeSimCallOptions(context).filter { it.account != null }.map { it.slotIndex }.sorted()
+            nextSlot = slots.firstOrNull { it > actualSlot } ?: slots.firstOrNull() ?: actualSlot
         }
         rotationUsed = nextUsed
         rotationSlot = nextSlot
@@ -292,8 +301,9 @@ private fun NovaApp(
         } else {
             context.startActivity(prepared.intent)
         }
+        callBackgrounded = false
+        launchedCall = prepared
         callLaunched = true
-        commitRotationAfterCall(prepared)
         message = "正在通过 ${prepared.simLabel} 拨出。"
     }
     val callPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -332,6 +342,7 @@ private fun NovaApp(
     }
     fun startCustomerCall(customer: Customer) {
         pendingCall = customer.id
+        callLaunched = false; callBackgrounded = false; launchedCall = null
         val prepared = prepareCustomerCall(customer)
         if (prepared == null) {
             pendingCall = null
@@ -349,16 +360,22 @@ private fun NovaApp(
         } else callPermissionLauncher.launch(Manifest.permission.CALL_PHONE)
     }
 
-    DisposableEffect(lifecycle, pendingCall, callLaunched) {
+    DisposableEffect(lifecycle) {
         val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE) {
+                // 只有通话界面真正接管前台后，才认为这次拨号已经发起。
+                if (pendingCall != null && callLaunched) callBackgrounded = true
+            }
             if (event == Lifecycle.Event.ON_RESUME) {
                 callPermissionGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
                 phoneStateGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED
                 callLogPermissionGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED
                 permissionsRefresh++
                 simRefresh++
-                if (pendingCall != null && callLaunched) {
-                    callLaunched = false; callLogRefresh++
+                if (pendingCall != null && callLaunched && callBackgrounded) {
+                    callLaunched = false; callBackgrounded = false; callLogRefresh++
+                    launchedCall?.let { commitRotationAfterCall(it) }
+                    launchedCall = null
                     val c = customers.firstOrNull { it.id == pendingCall }
                     if (c != null) { outcome = c.status.takeIf { it != "待联系" } ?: "已接通"; outcomeNote = ""; outcomeDate = c.followUp; outcomeTags = c.tags.toSet(); showOutcome = true }
                 }
@@ -372,13 +389,14 @@ private fun NovaApp(
         if (uri != null) try {
             val name = uri.lastPathSegment.orEmpty().lowercase(Locale.ROOT)
             val mime = context.contentResolver.getType(uri).orEmpty().lowercase(Locale.ROOT)
-            val rows = if (name.endsWith(".xlsx") || mime.contains("spreadsheetml")) readXlsx(context, uri) else {
-                val stream = context.contentResolver.openInputStream(uri) ?: error("无法打开文件")
-                BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readLines().map { line -> csvRow(line.removePrefix("\uFEFF")).map(String::trim) } }
+            val parsed = if (name.endsWith(".xlsx") || mime.contains("spreadsheetml")) {
+                readXlsxSheets(context, uri).flatMap { sheetRows -> rowsToCustomers(sheetRows) }
+            } else {
+                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: error("无法打开文件")
+                rowsToCustomers(parseCsv(decodeTextAuto(bytes)))
             }
-            val parsed = rowsToCustomers(rows)
-            val seen = customers.map { digits(it.phone) }.toMutableSet()
-            val fresh = parsed.filter { digits(it.phone).isNotBlank() && seen.add(digits(it.phone)) }
+            val seen = customers.map { phoneMatchKey(it.phone) }.toMutableSet()
+            val fresh = parsed.filter { phoneMatchKey(it.phone).isNotBlank() && seen.add(phoneMatchKey(it.phone)) }
             val importedTagNames = fresh.flatMap { it.tags }.distinct().filter { name -> tags.none { it.name == name } }
             if (importedTagNames.isNotEmpty()) {
                 saveTags(tags + importedTagNames.mapIndexed { index, name -> CustomerTag(name, palette[(tags.size + index) % palette.size]) })
@@ -400,22 +418,26 @@ private fun NovaApp(
 
     val todayForDialer = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
     val current = customers.firstOrNull { it.id == currentId }
-    val dialerCustomers = customers.filter { c ->
+    val dialerCustomers = remember(customers, dialerStatusFilter, dialerQuickFilter, todayForDialer) { customers.filter { c ->
         (dialerStatusFilter == "全部状态" || c.status == dialerStatusFilter) && when (dialerQuickFilter) {
             "到期回访" -> c.followUp.trim().take(10).let { it.isNotBlank() && it <= todayForDialer }
             "稍后回访" -> c.status == "稍后回访"
             else -> true
         }
+    } }
+    val visible = remember(customers, search, statusFilter, selectedTags) {
+        customers.filter { c ->
+            (search.isBlank() || c.name.contains(search, true) || c.phone.contains(search, true) || c.company.contains(search, true)) &&
+            (statusFilter == "全部状态" || c.status == statusFilter) && (selectedTags.isEmpty() || selectedTags.all { it in c.tags })
+        }
     }
-    val visible = customers.filter { c ->
-        (search.isBlank() || c.name.contains(search, true) || c.phone.contains(search, true) || c.company.contains(search, true)) &&
-        (statusFilter == "全部状态" || c.status == statusFilter) && (selectedTags.isEmpty() || selectedTags.all { it in c.tags })
-    }
-    val customerCallLogs = remember(callLogPermissionGranted, callLogRefresh, customers) {
-        if (callLogPermissionGranted) queryCustomerCallLogs(context) else emptyMap()
+    var customerCallLogs by remember { mutableStateOf<Map<String, SystemCallRecord>>(emptyMap()) }
+    LaunchedEffect(callLogPermissionGranted, callLogRefresh) {
+        customerCallLogs = if (callLogPermissionGranted) withContext(Dispatchers.IO) { queryCustomerCallLogs(context) } else emptyMap()
     }
     fun saveOutcome(goNext: Boolean) {
         val c = current ?: return
+        callLogRefresh++
         val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date())
         val appended = if (outcomeNote.isBlank()) c.note else listOf(c.note, "$stamp：${outcomeNote.trim()}").filter { it.isNotBlank() }.joinToString("\n")
         saveCustomers(customers.map { if (it.id == c.id) it.copy(status = outcome, note = appended, followUp = outcomeDate.trim(), tags = outcomeTags.toList(), lastContactAt = stamp) else it })
@@ -443,7 +465,7 @@ private fun NovaApp(
                         Brush.verticalGradient(listOf(Color.White, MaterialTheme.colorScheme.primary.copy(alpha = 0.045f)))
                     )
                 ) {
-                    Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Row(Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.statusBars).padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                         if (page != Page.HOME) {
                             IconButton(onClick = { page = Page.HOME }) {
                                 Icon(Icons.Filled.ArrowBack, contentDescription = "返回首页")
@@ -707,7 +729,10 @@ private fun NovaApp(
                 val touched = customers.filter { c -> c.note.lines().any { line -> line.trim().startsWith(periodPrefix) } }
                 val statusCount = callStatuses.filter { it != "待联系" }.associateWith { status -> touched.count { it.status == status } }
                 val periodStart = try { SimpleDateFormat(if (statsPeriod == "当天统计") "yyyy-MM-dd" else "yyyy-MM", Locale.getDefault()).parse(periodPrefix)?.time ?: 0L } catch (_: Exception) { 0L }
-                val systemCalls = remember(statsPeriod, callLogPermissionGranted, callLogRefresh, customers.size) { if (callLogPermissionGranted) queryOutgoingCalls(context, periodStart) else emptyList() }
+                var systemCalls by remember { mutableStateOf<List<SystemCallRecord>>(emptyList()) }
+                LaunchedEffect(statsPeriod, callLogPermissionGranted, callLogRefresh, customers.size) {
+                    systemCalls = if (callLogPermissionGranted) withContext(Dispatchers.IO) { queryOutgoingCalls(context, periodStart) } else emptyList()
+                }
                 Column(Modifier.fillMaxSize().padding(insets).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         FilterChip(selected = statsPeriod == "当天统计", onClick = { statsPeriod = "当天统计" }, label = { Text("当天统计") }, modifier = Modifier.weight(1f))
@@ -839,7 +864,7 @@ private fun NovaApp(
                             Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F9FC))) {
                                 Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                                     Text("轮换规则", fontWeight = FontWeight.Bold)
-                                    Text("同一张卡连续拨出指定次数后，自动切换另一张卡。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                                    Text("同一张卡连续拨出指定次数后，自动切换到下一张可用的卡。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
                                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                         listOf(1, 2, 3, 5, 10).forEach { count ->
                                             FilterChip(
@@ -1350,7 +1375,7 @@ private fun HomePriorityRow(customer: Customer, onClick: () -> Unit, onCall: () 
             TextButton(onClick = { if (newTag.isNotBlank()) { onCreateTag(newTag.trim()); chosen = chosen + newTag.trim(); newTag = "" } }, modifier = Modifier.widthIn(min = 64.dp)) { Text("添加", maxLines = 1) }
         }
         if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error)
-    } }, confirmButton = { Button(onClick = { if (name.isBlank() || phone.isBlank()) error = "姓名和电话不能为空。" else onSave((initial ?: Customer(name = name.trim(), phone = phone.trim())).copy(name = name.trim(), phone = phone.trim(), company = company.trim(), note = note.trim(), status = status, followUp = followUp.trim(), tags = chosen.toList())) }) { Text("保存") } }, dismissButton = { Row { if (initial != null) TextButton(onClick = { onDelete(initial) }) { Text("删除") }; TextButton(onClick = onDismiss) { Text("取消") } } })
+    } }, confirmButton = { Button(onClick = { if (name.isBlank() || phone.isBlank()) error = "姓名和电话不能为空。" else onSave((initial ?: Customer(name = name.trim(), phone = normalizeDialNumber(phone))).copy(name = name.trim(), phone = normalizeDialNumber(phone), company = company.trim(), note = note.trim(), status = status, followUp = followUp.trim(), tags = chosen.toList())) }) { Text("保存") } }, dismissButton = { Row { if (initial != null) TextButton(onClick = { onDelete(initial) }) { Text("删除") }; TextButton(onClick = onDismiss) { Text("取消") } } })
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -1457,7 +1482,7 @@ private fun dialModeDescription(
     return when {
         sim == null -> "SIM${slot + 1}（未检测到）"
         sim.account == null -> "SIM${slot + 1} · ${sim.network}（账户未就绪）"
-        else -> "SIM${slot + 1} · ${sim.network}"
+        else -> "SIM${slot + 1} · ${sim.network}${if (sim.verified) "" else "（顺序推测）"}"
     }
 }
 
@@ -1498,14 +1523,19 @@ private fun activeSimCallOptions(context: Context): List<SimCallOption> {
                 val id = handle.id.orEmpty()
                 id.matches(Regex("(^|\\D)${Regex.escape(subId.toString())}(\\D|$)"))
             }
-            // 华为等定制系统可能使用槽位号或内部 ID；只有双卡账户数量一致时才按系统排序兜底。
+            // Android 8/9 的通话账户 ID 为 ICCID，可直接精确匹配。
+            val iccMatch = subscription.iccId?.takeIf { it.isNotBlank() }?.let { icc ->
+                usableAccounts.firstOrNull { handle -> handle !in assigned && handle.id == icc }
+            }
+            // 华为等定制系统可能使用槽位号或内部 ID；只有账户数量一致时才按系统排序兜底（结果会标记为“顺序推测”）。
             val ordinalFallback = if (usableAccounts.size == activeSubscriptions.size) {
                 usableAccounts.getOrNull(index)?.takeIf { it !in assigned }
             } else null
-            val picked = exact ?: tokenMatch ?: ordinalFallback
+            val picked = exact ?: iccMatch ?: tokenMatch ?: ordinalFallback
             if (picked != null) assigned.add(picked)
             val method = when {
                 exact != null -> "subscription-id"
+                iccMatch != null -> "iccid"
                 tokenMatch != null -> "id-contains-subscription"
                 ordinalFallback != null -> "system-order"
                 else -> "unmatched"
@@ -1554,7 +1584,9 @@ private fun queryCustomerCallLogs(context: Context): Map<String, SystemCallRecor
             val dateIndex = cursor.getColumnIndexOrThrow(CallLog.Calls.DATE)
             val durationIndex = cursor.getColumnIndexOrThrow(CallLog.Calls.DURATION)
             val typeIndex = cursor.getColumnIndexOrThrow(CallLog.Calls.TYPE)
+            var scanned = 0
             while (cursor.moveToNext()) {
+                if (++scanned > 20000) break
                 val number = cursor.getString(numberIndex).orEmpty()
                 val key = phoneMatchKey(number)
                 if (key.isNotBlank() && key !in result) {
@@ -1603,11 +1635,36 @@ private fun queryOutgoingCalls(context: Context, periodStartMillis: Long): List<
     return result
 }
 
-private fun loadCustomers(context: Context): List<Customer> = try {
-    val a = JSONArray(context.getSharedPreferences("nova_customers", Context.MODE_PRIVATE).getString("data", "[]") ?: "[]")
-    (0 until a.length()).map { i -> val o = a.getJSONObject(i); Customer(o.optString("id", UUID.randomUUID().toString()), o.optString("name"), o.optString("phone"), o.optString("company"), o.optString("note"), o.optString("status", "待联系"), o.optString("followUp"), o.optJSONArray("tags")?.let { ar -> (0 until ar.length()).map { ar.optString(it) } } ?: emptyList(), o.optString("lastContactAt")) }.filter { it.name.isNotBlank() && it.phone.isNotBlank() }
-} catch (_: Exception) { emptyList() }
-private fun persistCustomers(context: Context, list: List<Customer>) { val a = JSONArray(); list.forEach { c -> a.put(JSONObject().apply { put("id", c.id); put("name", c.name); put("phone", c.phone); put("company", c.company); put("note", c.note); put("status", c.status); put("followUp", c.followUp); put("tags", JSONArray(c.tags)); put("lastContactAt", c.lastContactAt) }) }; context.getSharedPreferences("nova_customers", Context.MODE_PRIVATE).edit().putString("data", a.toString()).apply() }
+private val persistExecutor: java.util.concurrent.ExecutorService = java.util.concurrent.Executors.newSingleThreadExecutor()
+private fun customersFile(context: Context) = java.io.File(context.filesDir, "customers.json")
+private fun parseCustomers(text: String): List<Customer> {
+    val a = JSONArray(text)
+    return (0 until a.length()).map { i -> val o = a.getJSONObject(i); Customer(o.optString("id", UUID.randomUUID().toString()), o.optString("name"), o.optString("phone"), o.optString("company"), o.optString("note"), o.optString("status", "待联系"), o.optString("followUp"), o.optJSONArray("tags")?.let { ar -> (0 until ar.length()).map { ar.optString(it) } } ?: emptyList(), o.optString("lastContactAt")) }.filter { it.name.isNotBlank() && it.phone.isNotBlank() }
+}
+/** 优先读取 customers.json；不存在时迁移读取旧版 SharedPreferences 数据（旧数据保留不删）。 */
+private fun loadCustomers(context: Context): List<Customer> {
+    val file = customersFile(context)
+    if (file.exists()) {
+        try { return parseCustomers(file.readText(Charsets.UTF_8)) } catch (e: Exception) { Log.w("NovaDialer", "customers.json unreadable, falling back", e) }
+    }
+    return try {
+        parseCustomers(context.getSharedPreferences("nova_customers", Context.MODE_PRIVATE).getString("data", "[]") ?: "[]")
+    } catch (_: Exception) { emptyList() }
+}
+/** 在后台单线程里序列化并原子写入，避免大名单阻塞界面线程。 */
+private fun persistCustomers(context: Context, list: List<Customer>) {
+    val appContext = context.applicationContext
+    persistExecutor.execute {
+        try {
+            val a = JSONArray()
+            list.forEach { c -> a.put(JSONObject().apply { put("id", c.id); put("name", c.name); put("phone", c.phone); put("company", c.company); put("note", c.note); put("status", c.status); put("followUp", c.followUp); put("tags", JSONArray(c.tags)); put("lastContactAt", c.lastContactAt) }) }
+            val target = customersFile(appContext)
+            val tmp = java.io.File(target.parentFile, "customers.json.tmp")
+            tmp.writeText(a.toString(), Charsets.UTF_8)
+            if (!tmp.renameTo(target)) { target.delete(); tmp.renameTo(target) }
+        } catch (e: Exception) { Log.e("NovaDialer", "persistCustomers failed", e) }
+    }
+}
 private fun loadTags(context: Context): List<CustomerTag> = try { val a = JSONArray(context.getSharedPreferences("nova_tags", Context.MODE_PRIVATE).getString("data", "[]") ?: "[]"); (0 until a.length()).map { val o = a.getJSONObject(it); CustomerTag(o.optString("name"), o.optLong("color", palette[0])) } } catch (_: Exception) { emptyList() }
 private fun persistTags(context: Context, list: List<CustomerTag>) { val a = JSONArray(); list.forEach { a.put(JSONObject().apply { put("name", it.name); put("color", it.color) }) }; context.getSharedPreferences("nova_tags", Context.MODE_PRIVATE).edit().putString("data", a.toString()).apply() }
 private fun lastCommunication(c: Customer): String {
@@ -1616,7 +1673,7 @@ private fun lastCommunication(c: Customer): String {
     return c.note.lines().asReversed().firstNotNullOfOrNull { line -> pattern.find(line.trim())?.value } ?: "暂无记录"
 }
 private fun digits(s: String) = s.filter { it.isDigit() }
-private fun csvEscape(s: String) = "\"" + s.replace("\"", "\"\"").replace("\r", " ").replace("\n", " ") + "\""
+private fun csvEscape(s: String) = "\"" + s.replace("\"", "\"\"").replace("\r", "") + "\""
 
 private fun rowsToCustomers(rows: List<List<String>>): List<Customer> {
     val clean = rows.filter { it.any(String::isNotBlank) }
@@ -1668,20 +1725,20 @@ private fun rowsToCustomers(rows: List<List<String>>): List<Customer> {
             if (s.isBlank()) continue
             val digitsOnly = s.filter(Char::isDigit)
             if (digitsOnly.length in 7..15 && s.none { it.isLetter() }) {
-                result.add(digitsOnly)
+                result.add((if (s.startsWith("+")) "+" else "") + digitsOnly)
                 continue
             }
             // 有“电话：”等文字或括号、短横线时，提取其中的号码。
             val beforeCount = result.size
             Regex("(?<!\\d)\\+?\\d[\\d()\\-]{5,}\\d(?!\\d)").findAll(s).forEach { match ->
                 val d = match.value.filter(Char::isDigit)
-                if (d.length in 7..15) result.add(d)
+                if (d.length in 7..15) result.add((if (match.value.startsWith("+")) "+" else "") + d)
             }
             // 有些表格用空格隔开多个完整号码。
             if (result.size == beforeCount) {
                 s.split(Regex("\\s+")).forEach { token ->
                     val d = token.filter(Char::isDigit)
-                    if (d.length in 7..15) result.add(d)
+                    if (d.length in 7..15) result.add((if (token.startsWith("+")) "+" else "") + d)
                 }
             }
         }
@@ -1698,7 +1755,7 @@ private fun rowsToCustomers(rows: List<List<String>>): List<Customer> {
             val company = row.getOrNull(cc).orEmpty().trim()
             if (company.isBlank()) return@mapIndexedNotNull null
             val numbers = phoneCols.flatMap { phoneNumbers(row.getOrNull(it).orEmpty()) }
-                .filter { allSeenPhones.add(it) }
+                .filter { allSeenPhones.add(phoneMatchKey(it)) }
             if (numbers.isEmpty()) return@mapIndexedNotNull null
 
             val details = mutableListOf<String>()
@@ -1709,7 +1766,7 @@ private fun rowsToCustomers(rows: List<List<String>>): List<Customer> {
             row.getOrNull(mc).orEmpty().trim().takeIf { it.isNotBlank() }?.let { details.add(it) }
             val note = details.joinToString("；")
             val importedStatus = row.getOrNull(statusCol).orEmpty().trim().takeIf { it in callStatuses } ?: "待联系"
-            val importedFollowUp = row.getOrNull(followUpCol).orEmpty().trim()
+            val importedFollowUp = normalizeDateText(row.getOrNull(followUpCol).orEmpty())
             val importedTags = row.getOrNull(tagsCol).orEmpty().split("|", ";", "；")
                 .map(String::trim).filter(String::isNotBlank).distinct()
             val importedLastContact = row.getOrNull(lastContactCol).orEmpty().trim()
@@ -1736,14 +1793,14 @@ private fun rowsToCustomers(rows: List<List<String>>): List<Customer> {
         val phoneIndex = p ?: row.indexOfFirst { it.trim().matches(Regex("^\\+?[0-9][0-9() \\-]{5,}$")) }
         if (phoneIndex < 0 || row.getOrNull(phoneIndex).isNullOrBlank()) return@mapIndexedNotNull null
 
-        val numbers = phoneNumbers(row[phoneIndex]).filter { allSeenPhones.add(it) }
+        val numbers = phoneNumbers(row[phoneIndex]).filter { allSeenPhones.add(phoneMatchKey(it)) }
         if (numbers.isEmpty()) return@mapIndexedNotNull null
         val name = if (nc >= 0) row.getOrNull(nc).orEmpty().trim()
             else row.indices.firstOrNull { it != phoneIndex && row[it].isNotBlank() }?.let { row[it].trim() }.orEmpty()
         val company = if (cc >= 0) row.getOrNull(cc).orEmpty().trim() else row.getOrNull(2).orEmpty().trim()
         val note = if (mc >= 0) row.getOrNull(mc).orEmpty().trim() else row.getOrNull(3).orEmpty().trim()
         val importedStatus = row.getOrNull(statusCol).orEmpty().trim().takeIf { it in callStatuses } ?: "待联系"
-        val importedFollowUp = row.getOrNull(followUpCol).orEmpty().trim()
+        val importedFollowUp = normalizeDateText(row.getOrNull(followUpCol).orEmpty())
         val importedTags = row.getOrNull(tagsCol).orEmpty().split("|", ";", "；")
             .map(String::trim).filter(String::isNotBlank).distinct()
         val importedLastContact = row.getOrNull(lastContactCol).orEmpty().trim()
@@ -1761,16 +1818,3 @@ private fun rowsToCustomers(rows: List<List<String>>): List<Customer> {
         }
     }.flatten()
 }
-private fun readXlsx(context: Context, uri: Uri): List<List<String>> {
-    val entries = mutableMapOf<String, ByteArray>()
-    ZipInputStream(context.contentResolver.openInputStream(uri) ?: error("无法打开 Excel 文件")).use { z -> var e = z.nextEntry; while (e != null) { if (!e.isDirectory && (e.name == "xl/sharedStrings.xml" || e.name.matches(Regex("xl/worksheets/sheet[0-9]+\\.xml")))) entries[e.name] = z.readBytes(); e = z.nextEntry } }
-    val shared = mutableListOf<String>(); entries["xl/sharedStrings.xml"]?.let { bytes -> val p = XmlPullParserFactory.newInstance().newPullParser(); p.setInput(bytes.inputStream(), "UTF-8"); var inSi = false; val b = StringBuilder(); var ev = p.eventType; while (ev != XmlPullParser.END_DOCUMENT) { when(ev) { XmlPullParser.START_TAG -> when(p.name) { "si" -> { inSi = true; b.clear() }; "t" -> if (inSi) b.append(p.nextText()) }; XmlPullParser.END_TAG -> if (p.name == "si") { shared.add(b.toString()); inSi = false } }; ev = p.eventType; if (ev != XmlPullParser.END_DOCUMENT) ev = p.next() } }
-    val sheet = entries.keys.filter { it.matches(Regex("xl/worksheets/sheet[0-9]+\\.xml")) }.sorted().firstOrNull() ?: error("Excel 中没有可读取的工作表")
-    val p = XmlPullParserFactory.newInstance().newPullParser(); p.setInput(entries.getValue(sheet).inputStream(), "UTF-8"); val rows = mutableListOf<List<String>>(); var row = mutableMapOf<Int,String>(); var col = -1; var type = ""; var value = ""; var ev = p.eventType
-    while (ev != XmlPullParser.END_DOCUMENT) { when(ev) {
-        XmlPullParser.START_TAG -> when(p.name) { "row" -> row = mutableMapOf(); "c" -> { val ref = p.getAttributeValue(null,"r").orEmpty(); col = ref.takeWhile { it.isLetter() }.fold(0) { a,ch -> a*26 + (ch.uppercaseChar()-'A'+1) }-1; type = p.getAttributeValue(null,"t").orEmpty(); value = "" }; "v", "t" -> value = p.nextText() }
-        XmlPullParser.END_TAG -> when(p.name) { "c" -> if (col >= 0) row[col] = if (type == "s") shared.getOrNull(value.toIntOrNull() ?: -1).orEmpty() else value; "row" -> if (row.isNotEmpty()) rows.add((0..(row.keys.maxOrNull() ?: -1)).map { row[it].orEmpty() }) }
-    }; ev = p.eventType; if (ev != XmlPullParser.END_DOCUMENT) ev = p.next() }
-    return rows
-}
-private fun csvRow(line: String): List<String> { val out = mutableListOf<String>(); val cell = StringBuilder(); var quoted = false; var i = 0; while (i < line.length) { val c = line[i]; when { c == '"' && quoted && i+1 < line.length && line[i+1] == '"' -> { cell.append('"'); i++ }; c == '"' -> quoted = !quoted; c == ',' && !quoted -> { out.add(cell.toString()); cell.clear() }; else -> cell.append(c) }; i++ }; out.add(cell.toString()); return out }
