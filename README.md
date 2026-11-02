@@ -43,7 +43,7 @@ Android 客户回访与连续拨号工具，应用名为“沟通无限”，代
 1. 若仓库根目录有上传的源码 zip：解压并覆盖到工作区（不覆盖 `.github`，其中的工作流文件需要手动更新），并在日志列出变更文件。
 2. 运行单元测试（失败只提示，不阻断出包）。
 3. 使用仓库 Secrets 中的签名密钥构建 release 包：`KEYSTORE_BASE64`、`KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD`。缺少密钥时构建直接失败，不会回退到调试签名。日志会打印 keystore 与 APK 的证书 SHA-256，可与自己的 keystore 对比。
-4. 上传产物 `NovaCustomerDialer-release`（`app-release.apk`）。release 已开启 R8；如遇运行异常，可把 `app/build.gradle.kts` 中的 `isMinifyEnabled` 改为 `false`。
+4. 上传产物 `NovaCustomerDialer-release`（`app-release.apk`）。release 默认不开启 R8 压缩混淆，安装包约十几 MB；需要小体积（约 1–3 MB）时，把 workflow 中的构建命令改为 `gradle --no-daemon assembleRelease -PminifyRelease=true`（该模式未经真机验证，建议先试装）。
 5. 构建并上传成功后，才把覆盖结果提交到仓库并删除根目录的 zip（提交带 `[skip ci]`）。构建失败时仓库不变、zip 保留，修复后可直接重试。该步骤要求仓库开启 Settings → Actions → General → Workflow permissions → **Read and write permissions**。
 
 下载方式：GitHub 仓库 → Actions → 选择成功的运行 → Artifacts。覆盖安装要求签名密钥与已安装版本完全一致。
@@ -61,6 +61,7 @@ gradle -PstandaloneDebug=true assembleDebug
 - 请仅联系有合理联系依据、允许联系的客户，控制联系频率，并遵守当地电话营销和隐私法规。
 
 ## 更新记录
+- 0.11.0：界面优化——沟通状态使用颜色徽标（已接通/已成交/稍后回访/未接听/拒绝）；首页指标卡按语义着色并新增“今日进度”条；拨号页显示当前位置（第几位/共几位）；底部导航使用主题色选中指示；新增客户按钮改用图标；卡片、手机号等硬编码蓝色改为跟随所选主题色，补全配色方案。R8 改为默认关闭，需要时通过 `-PminifyRelease=true` 开启。
 - 0.10.1（CI 更新）：Actions 增加“解压覆盖上传的 zip → 构建 → 成功后提交并删除 zip”，并打印 keystore/APK 证书指纹。
 - 0.10.1：修复 CI 在缺少签名密钥时会静默回退为调试签名（会导致无法覆盖安装）的问题，恢复为缺密钥即失败，并在日志打印证书指纹；README 与实际功能（应用名、状态、页面、导入列、轮换次数、本机编译签名限制）对齐。
 - 0.10.0：修复选卡兜底可能静默拨错卡；轮换计数与结果弹窗改为通话界面接管前台后才触发；号码保留 `+`；去重统一处理 86 前缀；通话记录查询与客户数据写入移出主线程；适配 Android 15 边到边；导入支持 GBK、多行引号、全部工作表、科学计数法和日期序列号；轮换支持两张以上的卡；release 启用 R8。

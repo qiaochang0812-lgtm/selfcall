@@ -48,6 +48,7 @@ import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
@@ -141,7 +142,11 @@ class MainActivity : ComponentActivity() {
                         secondary = Color(0xFF2E8E78),
                         background = Color(0xFFF4F7FC),
                         surface = Color.White,
-                        surfaceVariant = Color(0xFFEAF0FA)
+                        surfaceVariant = Color(0xFFEAF0FA),
+                        onSurfaceVariant = Color(0xFF5B6678),
+                        outline = Color(0xFFB8C2D3),
+                        outlineVariant = Color(0xFFDDE3EE),
+                        secondaryContainer = Color(0xFFE3ECFB)
                     )
                 ) {
                     NovaApp(
@@ -496,15 +501,22 @@ private fun NovaApp(
         },
         snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
-            NavigationBar(containerColor = Color.White) {
-                NavigationBarItem(selected = page == Page.HOME, onClick = { page = Page.HOME }, icon = { Icon(Icons.Filled.Home, contentDescription = "首页") }, label = { Text("首页") })
-                NavigationBarItem(selected = page == Page.CUSTOMERS, onClick = { page = Page.CUSTOMERS }, icon = { Icon(Icons.Filled.People, contentDescription = "客户") }, label = { Text("客户") })
-                NavigationBarItem(selected = page == Page.DIALER, onClick = { page = Page.DIALER }, icon = { Icon(Icons.Filled.Call, contentDescription = "拨号") }, label = { Text("拨号") })
-                NavigationBarItem(selected = page == Page.STATS, onClick = { page = Page.STATS }, icon = { Icon(Icons.Filled.BarChart, contentDescription = "统计") }, label = { Text("统计") })
-                NavigationBarItem(selected = page == Page.SETTINGS || page == Page.TAGS, onClick = { page = Page.SETTINGS }, icon = { Icon(Icons.Filled.Settings, contentDescription = "设置") }, label = { Text("设置") })
+            val navItemColors = NavigationBarItemDefaults.colors(
+                selectedIconColor = MaterialTheme.colorScheme.primary,
+                selectedTextColor = MaterialTheme.colorScheme.primary,
+                indicatorColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                unselectedIconColor = Color(0xFF7A8699),
+                unselectedTextColor = Color(0xFF7A8699)
+            )
+            NavigationBar(containerColor = Color.White, tonalElevation = 0.dp) {
+                NavigationBarItem(selected = page == Page.HOME, onClick = { page = Page.HOME }, colors = navItemColors, icon = { Icon(Icons.Filled.Home, contentDescription = "首页") }, label = { Text("首页") })
+                NavigationBarItem(selected = page == Page.CUSTOMERS, onClick = { page = Page.CUSTOMERS }, colors = navItemColors, icon = { Icon(Icons.Filled.People, contentDescription = "客户") }, label = { Text("客户") })
+                NavigationBarItem(selected = page == Page.DIALER, onClick = { page = Page.DIALER }, colors = navItemColors, icon = { Icon(Icons.Filled.Call, contentDescription = "拨号") }, label = { Text("拨号") })
+                NavigationBarItem(selected = page == Page.STATS, onClick = { page = Page.STATS }, colors = navItemColors, icon = { Icon(Icons.Filled.BarChart, contentDescription = "统计") }, label = { Text("统计") })
+                NavigationBarItem(selected = page == Page.SETTINGS || page == Page.TAGS, onClick = { page = Page.SETTINGS }, colors = navItemColors, icon = { Icon(Icons.Filled.Settings, contentDescription = "设置") }, label = { Text("设置") })
             }
         },
-        floatingActionButton = { if (page == Page.CUSTOMERS) FloatingActionButton(onClick = { editing = null; showEditor = true }) { Text("+", style = MaterialTheme.typography.headlineMedium) } }
+        floatingActionButton = { if (page == Page.CUSTOMERS) FloatingActionButton(onClick = { editing = null; showEditor = true }, containerColor = MaterialTheme.colorScheme.primary, contentColor = Color.White) { Icon(Icons.Filled.Add, contentDescription = "新增客户") } }
     ) { insets ->
         when(page) {
             Page.HOME -> HomeScreen(
@@ -657,10 +669,9 @@ private fun NovaApp(
                                     Surface(shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)) {
                                         Text("当前客户", Modifier.padding(horizontal = 10.dp, vertical = 5.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Medium)
                                     }
+                                    Text("  ${dialerCustomers.indexOfFirst { it.id == current.id } + 1} / ${dialerCustomers.size}", style = MaterialTheme.typography.labelMedium, color = Color(0xFF7A8699))
                                     Spacer(Modifier.weight(1f))
-                                    Surface(shape = RoundedCornerShape(50), color = Color(0xFFF0F2F5)) {
-                                        Text(current.status, Modifier.padding(horizontal = 9.dp, vertical = 4.dp), style = MaterialTheme.typography.labelSmall, color = Color(0xFF4F5C6D))
-                                    }
+                                    StatusBadge(current.status)
                                 }
                                 Text(current.name, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, maxLines = 2)
                                 Text(current.phone, style = MaterialTheme.typography.titleLarge, color = Color(0xFF34445B), maxLines = 1, softWrap = false)
@@ -1207,9 +1218,29 @@ private fun HomeScreen(
 
         item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                HomeMetricCard("$waiting", "待联系", Modifier.weight(1f))
-                HomeMetricCard("$dueFollowUps", "到期回访", Modifier.weight(1f), onClick = onDueFollowUps)
-                HomeMetricCard("$laterFollowUps", "稍后回访", Modifier.weight(1f), onClick = onLaterFollowUps)
+                HomeMetricCard("$waiting", "待联系", Modifier.weight(1f), accent = MaterialTheme.colorScheme.primary)
+                HomeMetricCard("$dueFollowUps", "到期回访", Modifier.weight(1f), onClick = onDueFollowUps, accent = Color(0xFFD9534F))
+                HomeMetricCard("$laterFollowUps", "稍后回访", Modifier.weight(1f), onClick = onLaterFollowUps, accent = Color(0xFFC98A1B))
+            }
+        }
+
+        item {
+            val contactedToday = customers.count { it.lastContactAt.startsWith(today) }
+            val progress = contactedToday.toFloat() / (contactedToday + waiting).coerceAtLeast(1)
+            Column(
+                Modifier.fillMaxWidth().background(Color.White, RoundedCornerShape(16.dp)).padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("今日进度", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                    Text("已联系 $contactedToday 位 · 待联系 $waiting 位", style = MaterialTheme.typography.bodySmall, color = Color(0xFF667287))
+                }
+                LinearProgressIndicator(
+                    progress = { progress },
+                    modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(50)),
+                    color = MaterialTheme.colorScheme.primary,
+                    trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                )
             }
         }
 
@@ -1250,7 +1281,7 @@ private fun HomeScreen(
 }
 
 @Composable
-private fun HomeMetricCard(value: String, label: String, modifier: Modifier = Modifier, onClick: (() -> Unit)? = null) {
+private fun HomeMetricCard(value: String, label: String, modifier: Modifier = Modifier, onClick: (() -> Unit)? = null, accent: Color = Color.Unspecified) {
     val clickModifier = if (onClick != null) modifier.clickable(onClick = onClick) else modifier
     Column(
         clickModifier
@@ -1258,7 +1289,7 @@ private fun HomeMetricCard(value: String, label: String, modifier: Modifier = Mo
             .padding(horizontal = 13.dp, vertical = 11.dp),
         verticalArrangement = Arrangement.spacedBy(1.dp)
     ) {
-        Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+        Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = accent)
         Text(label, style = MaterialTheme.typography.bodySmall, color = Color(0xFF737D8B))
     }
 }
@@ -1301,8 +1332,8 @@ private fun HomePriorityRow(customer: Customer, onClick: () -> Unit, onCall: () 
 @Composable private fun HomeAction(title: String, subtitle: String, icon: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
     Card(modifier.clickable(onClick = onClick), shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
         Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(42.dp).background(Color(0xFFEAF0FF), RoundedCornerShape(13.dp)), contentAlignment = Alignment.Center) {
-                Text(icon, color = Color(0xFF245BDB), style = MaterialTheme.typography.titleLarge)
+            Box(Modifier.size(42.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.10f), RoundedCornerShape(13.dp)), contentAlignment = Alignment.Center) {
+                Text(icon, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.titleLarge)
             }
             Column(Modifier.weight(1f).padding(start = 12.dp)) {
                 Text(title, fontWeight = FontWeight.Bold)
@@ -1315,11 +1346,11 @@ private fun HomePriorityRow(customer: Customer, onClick: () -> Unit, onCall: () 
 
 @Composable private fun MetricCard(label: String, value: String, modifier: Modifier = Modifier) { Card(modifier, shape = RoundedCornerShape(18.dp)) { Column(Modifier.fillMaxWidth().padding(14.dp)) { Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Color(0xFF245BDB)); Text(label, style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B)) } } }
 @Composable private fun CustomerCard(c: Customer, tags: List<CustomerTag>, selected: Boolean, callSummary: String?, callLogAccess: Boolean, onSelect: (Boolean) -> Unit, onOpen: () -> Unit, onEdit: () -> Unit) {
-    Card(shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = if (selected) Color(0xFFEAF0FF) else Color.White)) { Column(Modifier.fillMaxWidth().padding(12.dp)) {
+    Card(shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.09f) else Color.White)) { Column(Modifier.fillMaxWidth().padding(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(checked = selected, onCheckedChange = onSelect)
-            Column(Modifier.weight(1f).clickable(onClick = onOpen)) { Text(c.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold); Text(c.phone, style = MaterialTheme.typography.bodyMedium, color = Color(0xFF245BDB)); if (c.company.isNotBlank()) Text(c.company, style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B)) }
-            AssistChip(onClick = onOpen, label = { Text(c.status) })
+            Column(Modifier.weight(1f).clickable(onClick = onOpen)) { Text(c.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold); Text(c.phone, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary); if (c.company.isNotBlank()) Text(c.company, style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B)) }
+            StatusBadge(c.status)
         }
         if (c.tags.isNotEmpty()) Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) { c.tags.forEach { name -> val tag = tags.firstOrNull { it.name == name }; AssistChip(onClick = {}, label = { Text(name) }, leadingIcon = { Box(Modifier.size(8.dp).background(Color(tag?.color ?: palette[0]), RoundedCornerShape(50))) }) } }
         if (c.note.isNotBlank()) Text("备注：${c.note.takeLast(90)}", style = MaterialTheme.typography.bodySmall, maxLines = 2, color = Color(0xFF475569))
@@ -1393,6 +1424,23 @@ private fun HomePriorityRow(customer: Customer, onClick: () -> Unit, onCall: () 
         }
         if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error)
     } }, confirmButton = { Button(onClick = { if (name.isBlank()) error = "请输入标签名称。" else onSave(CustomerTag(name.trim(), color)) }) { Text("保存") } }, dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } })
+}
+
+private fun statusColors(status: String): Pair<Color, Color> = when (status) {
+    "已接通" -> Color(0xFFE6F4EE) to Color(0xFF247257)
+    "已成交" -> Color(0xFFE3ECFB) to Color(0xFF2A58C8)
+    "稍后回访" -> Color(0xFFFFF1D9) to Color(0xFF9A6A12)
+    "未接听" -> Color(0xFFF0F2F5) to Color(0xFF5B6678)
+    "拒绝" -> Color(0xFFFCE7E6) to Color(0xFFB23B37)
+    else -> Color(0xFFEDF1F8) to Color(0xFF4F5C6D)
+}
+
+@Composable
+private fun StatusBadge(status: String) {
+    val (background, foreground) = statusColors(status)
+    Surface(shape = RoundedCornerShape(50), color = background) {
+        Text(status, Modifier.padding(horizontal = 10.dp, vertical = 4.dp), style = MaterialTheme.typography.labelMedium, color = foreground, fontWeight = FontWeight.Medium, maxLines = 1)
+    }
 }
 
 @Composable

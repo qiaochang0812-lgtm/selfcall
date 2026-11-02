@@ -4,6 +4,8 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val minifyRelease = providers.gradleProperty("minifyRelease").orNull == "true"
+
 android {
     namespace = "com.example.novacustomerdialer"
     compileSdk = 35
@@ -12,8 +14,8 @@ android {
         applicationId = "com.example.novacustomerdialer"
         minSdk = 26
         targetSdk = 35
-        versionCode = 13
-        versionName = "0.10.1"
+        versionCode = 14
+        versionName = "0.11.0"
     }
 
     compileOptions {
@@ -44,8 +46,9 @@ android {
         }
         getByName("release") {
             signingConfig = signingConfigs.getByName("release")
-            isMinifyEnabled = true
-            isShrinkResources = true
+            // 默认不压缩混淆（体积较大但与历史版本行为一致）；需要小体积时用 -PminifyRelease=true
+            isMinifyEnabled = minifyRelease
+            isShrinkResources = minifyRelease
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
