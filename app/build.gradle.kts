@@ -4,7 +4,7 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-val minifyRelease = providers.gradleProperty("minifyRelease").orNull == "true"
+val minifyRelease = providers.gradleProperty("minifyRelease").orNull != "false"
 
 android {
     namespace = "com.example.novacustomerdialer"
@@ -46,7 +46,7 @@ android {
         }
         getByName("release") {
             signingConfig = signingConfigs.getByName("release")
-            // 默认不压缩混淆（体积较大但与历史版本行为一致）；需要小体积时用 -PminifyRelease=true
+            // Release 默认启用 R8 混淆与资源压缩；如需临时关闭可使用 -PminifyRelease=false
             isMinifyEnabled = minifyRelease
             isShrinkResources = minifyRelease
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")

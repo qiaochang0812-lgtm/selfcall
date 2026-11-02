@@ -39,6 +39,15 @@ class ImportParsingTest {
     }
 
     @Test
+    fun filtersMainlandLandlineNumbersWithoutDroppingMobileNumbers() {
+        assertEquals(true, isMainlandLandlineNumber("010-12345678"))
+        assertEquals(true, isMainlandLandlineNumber("+86 21 12345678"))
+        assertEquals(true, isMainlandLandlineNumber("12345678"))
+        assertEquals(false, isMainlandLandlineNumber("13800138000"))
+        assertEquals(false, isMainlandLandlineNumber("+1 415 555 2671"))
+    }
+
+    @Test
     fun expandsScientificNumbers() {
         assertEquals("13800138000", plainNumber("1.3800138E10"))
         assertEquals("13800138000", plainNumber("13800138000"))

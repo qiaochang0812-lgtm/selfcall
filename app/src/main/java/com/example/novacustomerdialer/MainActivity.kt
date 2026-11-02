@@ -49,6 +49,7 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
@@ -73,6 +74,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.text.SimpleDateFormat
@@ -91,7 +93,7 @@ data class Customer(
     val followUp: String = "", val tags: List<String> = emptyList(), val lastContactAt: String = ""
 )
 data class CustomerTag(val name: String, val color: Long = palette[0])
-private enum class Page { HOME, CUSTOMERS, DIALER, SETTINGS, STATS, TAGS }
+private enum class Page { HOME, CUSTOMERS, DIALER, SETTINGS, STATS, TAGS, ABOUT }
 
 private data class SimCallOption(
     val slotIndex: Int,
@@ -102,8 +104,6 @@ private data class SimCallOption(
     val matchMethod: String
 ) {
     val title: String get() = "SIM${slotIndex + 1}"
-    /** 仅靠系统返回顺序推测出的映射不可靠，界面会提示用户核对。 */
-    val verified: Boolean get() = matchMethod != "system-order"
     val network: String get() = displayName.ifBlank { carrierName }.ifBlank { "已识别 SIM" }
 }
 
@@ -208,6 +208,7 @@ private fun NovaApp(
     var simRefresh by remember { mutableIntStateOf(0) }
     var permissionsRefresh by remember { mutableIntStateOf(0) }
     var pendingCallRequest by remember { mutableStateOf<PreparedCustomerCall?>(null) }
+    var pendingNextCallId by remember { mutableStateOf<String?>(null) }
     var outcome by remember { mutableStateOf("已接通") }
     var outcomeNote by remember { mutableStateOf("") }
     var outcomeDate by remember { mutableStateOf("") }
@@ -277,7 +278,7 @@ private fun NovaApp(
             return null
         }
         val intent = Intent(Intent.ACTION_CALL, uri).putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, account)
-        return PreparedCustomerCall(intent, account, requestedSlot, "${sim.title} · ${sim.network}" + if (sim.verified) "" else "（顺序推测，请核对实际拨出卡）")
+        return PreparedCustomerCall(intent, account, requestedSlot, "${sim.title} · ${sim.network}")
     }
     fun commitRotationAfterCall(prepared: PreparedCustomerCall) {
         val actualSlot = prepared.simSlotIndex ?: return
@@ -451,9 +452,20 @@ private fun NovaApp(
         showOutcome = false
         pendingCall = null
         message = if (goNext && next != null) "记录已保存，正在拨打下一位。" else if (goNext) "记录已保存，当前筛选名单已到最后一位。" else "沟通记录已保存。"
-        if (next != null) {
-            currentId = next.id
-            startCustomerCall(next)
+        pendingNextCallId = next?.id
+    }
+
+    // 先让快速记录对话框完成关闭和界面状态更新，再启动下一通电话。
+    LaunchedEffect(showOutcome, pendingNextCallId) {
+        val nextId = pendingNextCallId
+        if (!showOutcome && nextId != null) {
+            yield()
+            val nextCustomer = customers.firstOrNull { it.id == nextId }
+            pendingNextCallId = null
+            if (nextCustomer != null) {
+                currentId = nextCustomer.id
+                startCustomerCall(nextCustomer)
+            }
         }
     }
 
@@ -482,6 +494,7 @@ private fun NovaApp(
                                     when (page) {
                                         Page.HOME -> Icons.Filled.Home
                                         Page.CUSTOMERS, Page.TAGS -> Icons.Filled.People
+                                        Page.ABOUT -> Icons.Filled.Info
                                         Page.DIALER -> Icons.Filled.Call
                                         Page.STATS -> Icons.Filled.BarChart
                                         Page.SETTINGS -> Icons.Filled.Settings
@@ -492,8 +505,8 @@ private fun NovaApp(
                             }
                         }
                         Column(Modifier.weight(1f).padding(start = 12.dp)) {
-                            Text(when(page) { Page.HOME -> "沟通无限"; Page.CUSTOMERS -> "客户管理"; Page.DIALER -> "连续拨号"; Page.SETTINGS -> "设置"; Page.STATS -> "统计报表"; Page.TAGS -> "标签管理" }, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                            Text(when(page) { Page.HOME -> "高效沟通 · 客户无限"; Page.CUSTOMERS -> "搜索 · 分类 · 批量管理"; Page.DIALER -> "拨打后记录结果，继续下一位"; Page.SETTINGS -> "双卡拨号、权限与数据管理"; Page.STATS -> "当天与当月跟进情况"; Page.TAGS -> "按业务需要定义客户分类" }, style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                            Text(when(page) { Page.HOME -> "沟通无限"; Page.CUSTOMERS -> "客户管理"; Page.DIALER -> "连续拨号"; Page.SETTINGS -> "设置"; Page.STATS -> "统计报表"; Page.TAGS -> "标签管理"; Page.ABOUT -> "关于" }, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                            Text(when(page) { Page.HOME -> "高效沟通 · 客户无限"; Page.CUSTOMERS -> "搜索 · 分类 · 批量管理"; Page.DIALER -> "拨打后记录结果，继续下一位"; Page.SETTINGS -> "双卡拨号、权限与数据管理"; Page.STATS -> "当天与当月跟进情况"; Page.TAGS -> "按业务需要定义客户分类"; Page.ABOUT -> "应用信息与免责声明" }, style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
                         }
                     }
                 }
@@ -513,7 +526,7 @@ private fun NovaApp(
                 NavigationBarItem(selected = page == Page.CUSTOMERS, onClick = { page = Page.CUSTOMERS }, colors = navItemColors, icon = { Icon(Icons.Filled.People, contentDescription = "客户") }, label = { Text("客户") })
                 NavigationBarItem(selected = page == Page.DIALER, onClick = { page = Page.DIALER }, colors = navItemColors, icon = { Icon(Icons.Filled.Call, contentDescription = "拨号") }, label = { Text("拨号") })
                 NavigationBarItem(selected = page == Page.STATS, onClick = { page = Page.STATS }, colors = navItemColors, icon = { Icon(Icons.Filled.BarChart, contentDescription = "统计") }, label = { Text("统计") })
-                NavigationBarItem(selected = page == Page.SETTINGS || page == Page.TAGS, onClick = { page = Page.SETTINGS }, colors = navItemColors, icon = { Icon(Icons.Filled.Settings, contentDescription = "设置") }, label = { Text("设置") })
+                NavigationBarItem(selected = page == Page.SETTINGS || page == Page.TAGS || page == Page.ABOUT, onClick = { page = Page.SETTINGS }, colors = navItemColors, icon = { Icon(Icons.Filled.Settings, contentDescription = "设置") }, label = { Text("设置") })
             }
         },
         floatingActionButton = { if (page == Page.CUSTOMERS) FloatingActionButton(onClick = { editing = null; showEditor = true }, containerColor = MaterialTheme.colorScheme.primary, contentColor = Color.White) { Icon(Icons.Filled.Add, contentDescription = "新增客户") } }
@@ -727,7 +740,6 @@ private fun NovaApp(
                                     overflow = TextOverflow.Ellipsis
                                 )
                             }
-                            Text("按下后直接拨出，不需要再次选择电话卡", style = MaterialTheme.typography.labelSmall, color = Color(0xFF737D8B), modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 3.dp))
                         }
                     }
                 }
@@ -947,6 +959,7 @@ private fun NovaApp(
                         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             SettingsLink("客户标签", "创建、编辑标签及颜色", Icons.Filled.People) { page = Page.TAGS }
                             SettingsLink("沟通统计", "当天与当月拨出记录和跟进情况", Icons.Filled.BarChart) { page = Page.STATS }
+                            SettingsLink("关于", "版本信息与使用说明", Icons.Filled.Info) { page = Page.ABOUT }
                         }
                     }
 
@@ -1037,6 +1050,17 @@ private fun NovaApp(
                     } } }
                 }
             }
+            Page.ABOUT -> Column(
+                Modifier.fillMaxSize().padding(insets).padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Text("沟通无限", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                Text("版本 0.11.0", color = Color(0xFF64748B))
+                Text("用于管理本机客户名单、拨打电话、记录沟通情况和安排回访。客户资料保存在当前设备中。")
+                HorizontalDivider()
+                Text("免责声明", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text("本应用仅提供客户资料整理与电话拨号辅助功能。请确保你有权使用导入的客户信息，并遵守适用的隐私保护、个人信息及通信相关法律法规。拨号前请核对联系人和号码；实际通话及资费由运营商提供的通信服务决定。开发者不对因用户导入的数据、拨号操作或第三方通信服务产生的损失承担责任。")
+            }
         }
     }
 
@@ -1045,7 +1069,7 @@ private fun NovaApp(
     }, onDelete = { c -> saveCustomers(customers.filterNot { it.id == c.id }); showEditor = false; message = "客户已删除。" }, onCreateTag = { name -> if (tags.none { it.name.equals(name,true) }) saveTags(tags + CustomerTag(name, palette[tags.size % palette.size])) })
 
     if (showOutcome && current != null) AlertDialog(
-        onDismissRequest = { showOutcome = false; pendingCall = null },
+        onDismissRequest = { showOutcome = false; pendingCall = null; pendingNextCallId = null },
         title = { Text("快速记录 · ${current.name}") },
         text = {
             Column(Modifier.fillMaxWidth().heightIn(max = 440.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1086,7 +1110,7 @@ private fun NovaApp(
             Button(onClick = { saveOutcome(false) }, modifier = Modifier.fillMaxWidth()) { Text("保存记录") }
             Button(onClick = { saveOutcome(true) }, modifier = Modifier.fillMaxWidth()) { Text("保存并拨下一位") }
         } },
-        dismissButton = { TextButton(onClick = { showOutcome = false; pendingCall = null }) { Text("稍后记录") } }
+        dismissButton = { TextButton(onClick = { showOutcome = false; pendingCall = null; pendingNextCallId = null }) { Text("稍后记录") } }
     )
 
     if (showDeleteConfirm) AlertDialog(onDismissRequest = { showDeleteConfirm = false }, title = { Text("批量删除客户") }, text = { Text("确定删除已选的 ${selected.size} 位客户？此操作不可撤销。") }, confirmButton = { Button(onClick = { val n = selected.size; saveCustomers(customers.filterNot { it.id in selected }); selected = emptySet(); showDeleteConfirm = false; message = "已删除 $n 位客户。" }) { Text("确认删除") } }, dismissButton = { TextButton(onClick = { showDeleteConfirm = false }) { Text("取消") } })
@@ -1530,7 +1554,7 @@ private fun dialModeDescription(
     return when {
         sim == null -> "SIM${slot + 1}（未检测到）"
         sim.account == null -> "SIM${slot + 1} · ${sim.network}（账户未就绪）"
-        else -> "SIM${slot + 1} · ${sim.network}${if (sim.verified) "" else "（顺序推测）"}"
+        else -> "SIM${slot + 1} · ${sim.network}"
     }
 }
 
@@ -1575,7 +1599,7 @@ private fun activeSimCallOptions(context: Context): List<SimCallOption> {
             val iccMatch = subscription.iccId?.takeIf { it.isNotBlank() }?.let { icc ->
                 usableAccounts.firstOrNull { handle -> handle !in assigned && handle.id == icc }
             }
-            // 华为等定制系统可能使用槽位号或内部 ID；只有账户数量一致时才按系统排序兜底（结果会标记为“顺序推测”）。
+            // 部分定制系统可能使用槽位号或内部 ID；只有账户数量一致时才按系统顺序进行兜底匹配。
             val ordinalFallback = if (usableAccounts.size == activeSubscriptions.size) {
                 usableAccounts.getOrNull(index)?.takeIf { it !in assigned }
             } else null
@@ -1737,8 +1761,13 @@ private fun rowsToCustomers(rows: List<List<String>>): List<Customer> {
         "联系电话号码", "电话号码", "工商年报电话", "更多联系电话", "固定电话", "座机", "联系手机",
         "手机1", "手机2", "电话1", "电话2", "联系电话1", "联系电话2"
     )
+    fun isLandlineHeader(value: String): Boolean {
+        val h = norm(value)
+        return h.contains("固定电话") || h.contains("座机") || h == "landline"
+    }
     fun isPhoneHeader(value: String): Boolean {
         val h = norm(value)
+        if (isLandlineHeader(value)) return false
         return h in phoneKeys || h.startsWith("更多联系电话") ||
             h.startsWith("工商年报电话") || h.startsWith("联系电话") ||
             h.matches(Regex("^(手机|电话|手机号|mobile|phone|tel)\\d+$"))
@@ -1746,7 +1775,8 @@ private fun rowsToCustomers(rows: List<List<String>>): List<Customer> {
 
     // 支持常规客户表，也支持企业查询导出表（企业名称 + 多个联系电话字段）。
     val headerIndex = clean.indexOfFirst { row ->
-        row.any { norm(it) in nameKeys || norm(it) in companyKeys } && row.any { isPhoneHeader(it) }
+        row.any { norm(it) in nameKeys || norm(it) in companyKeys } &&
+            row.any { isPhoneHeader(it) || isLandlineHeader(it) }
     }
     val header = if (headerIndex >= 0) clean[headerIndex].map(::norm) else emptyList()
     fun col(keys: Set<String>) = header.indexOfFirst { it in keys }
@@ -1773,20 +1803,27 @@ private fun rowsToCustomers(rows: List<List<String>>): List<Customer> {
             if (s.isBlank()) continue
             val digitsOnly = s.filter(Char::isDigit)
             if (digitsOnly.length in 7..15 && s.none { it.isLetter() }) {
-                result.add((if (s.startsWith("+")) "+" else "") + digitsOnly)
+                val normalized = (if (s.startsWith("+")) "+" else "") + digitsOnly
+                if (!isMainlandLandlineNumber(normalized)) result.add(normalized)
                 continue
             }
             // 有“电话：”等文字或括号、短横线时，提取其中的号码。
             val beforeCount = result.size
             Regex("(?<!\\d)\\+?\\d[\\d()\\-]{5,}\\d(?!\\d)").findAll(s).forEach { match ->
                 val d = match.value.filter(Char::isDigit)
-                if (d.length in 7..15) result.add((if (match.value.startsWith("+")) "+" else "") + d)
+                if (d.length in 7..15) {
+                    val normalized = (if (match.value.startsWith("+")) "+" else "") + d
+                    if (!isMainlandLandlineNumber(normalized)) result.add(normalized)
+                }
             }
             // 有些表格用空格隔开多个完整号码。
             if (result.size == beforeCount) {
                 s.split(Regex("\\s+")).forEach { token ->
                     val d = token.filter(Char::isDigit)
-                    if (d.length in 7..15) result.add((if (token.startsWith("+")) "+" else "") + d)
+                    if (d.length in 7..15) {
+                        val normalized = (if (token.startsWith("+")) "+" else "") + d
+                        if (!isMainlandLandlineNumber(normalized)) result.add(normalized)
+                    }
                 }
             }
         }
@@ -1796,6 +1833,7 @@ private fun rowsToCustomers(rows: List<List<String>>): List<Customer> {
     val allSeenPhones = mutableSetOf<String>()
     return clean.mapIndexedNotNull { i, row ->
         if (i == headerIndex) return@mapIndexedNotNull null
+        if (headerIndex >= 0 && phoneCols.isEmpty()) return@mapIndexedNotNull null
 
         val enterpriseMode = headerIndex >= 0 && cc >= 0 && phoneCols.isNotEmpty() &&
             (nc < 0 || phoneCols.size > 1 || header.any { it == "工商年报电话" || it == "更多联系电话" })

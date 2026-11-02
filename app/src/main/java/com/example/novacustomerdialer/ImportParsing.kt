@@ -240,3 +240,16 @@ internal fun readXlsxSheets(context: Context, uri: Uri): List<List<List<String>>
     if (sheets.isEmpty()) error("Excel 中没有可读取的工作表")
     return sheets.sortedBy { it.first }.map { it.second }
 }
+
+
+/** 识别中国大陆常见固定电话格式；国际号码及 11 位手机号不按长度误删。 */
+internal fun isMainlandLandlineNumber(raw: String): Boolean {
+    var digits = raw.filter { it.isDigit() }
+    if (digits.startsWith("0086")) digits = digits.removePrefix("0086")
+    else if (digits.startsWith("86") && digits.length >= 11) digits = digits.removePrefix("86")
+    if (digits.length in 7..8) return true
+    if (digits.length in 10..12 && digits.startsWith("0")) return true
+    // 国际写法 +86 21 12345678：仅在明确带中国国家码时按区号识别。
+    val hasChinaCountryCode = raw.trim().startsWith("+86") || raw.trim().startsWith("0086")
+    return hasChinaCountryCode && digits.matches(Regex("^(10|2[0-9]|[3-9]\\d{2})\\d{7,8}$"))
+}
