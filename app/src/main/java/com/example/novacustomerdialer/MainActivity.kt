@@ -16,6 +16,7 @@ import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -50,6 +51,7 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Palette
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
@@ -93,7 +95,8 @@ data class Customer(
     val followUp: String = "", val tags: List<String> = emptyList(), val lastContactAt: String = ""
 )
 data class CustomerTag(val name: String, val color: Long = palette[0])
-private enum class Page { HOME, CUSTOMERS, DIALER, SETTINGS, STATS, TAGS, ABOUT }
+private enum class Page { HOME, CUSTOMERS, DIALER, SETTINGS, STATS, TAGS, ABOUT, DIAL_PREFS, APPEARANCE, PERMISSIONS }
+private val settingsSubPages = setOf(Page.TAGS, Page.ABOUT, Page.DIAL_PREFS, Page.APPEARANCE, Page.PERMISSIONS)
 
 private data class SimCallOption(
     val slotIndex: Int,
@@ -395,6 +398,7 @@ private fun NovaApp(
         if (uri != null) try {
             val name = uri.lastPathSegment.orEmpty().lowercase(Locale.ROOT)
             val mime = context.contentResolver.getType(uri).orEmpty().lowercase(Locale.ROOT)
+            skippedLandlineCount = 0
             val parsed = if (name.endsWith(".xlsx") || mime.contains("spreadsheetml")) {
                 readXlsxSheets(context, uri).flatMap { sheetRows -> rowsToCustomers(sheetRows) }
             } else {
@@ -407,7 +411,7 @@ private fun NovaApp(
             if (importedTagNames.isNotEmpty()) {
                 saveTags(tags + importedTagNames.mapIndexed { index, name -> CustomerTag(name, palette[(tags.size + index) % palette.size]) })
             }
-            saveCustomers(customers + fresh); message = "识别 ${parsed.size} 条，新增 ${fresh.size} 条，重复号码已跳过。"
+            saveCustomers(customers + fresh); message = "识别 ${parsed.size} 条，新增 ${fresh.size} 条，重复号码已跳过" + (if (skippedLandlineCount > 0) "，已剔除固话/服务号 $skippedLandlineCount 个。" else "。")
         } catch (e: Exception) { message = "导入失败：${e.message ?: "请检查文件格式"}" }
     }
     val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
@@ -474,6 +478,35 @@ private fun NovaApp(
         if (message.isNotBlank()) snackbarHostState.showSnackbar(message)
     }
 
+    fun applySimMode(mode: String) {
+        simMode = mode
+        rotationSlot = 0
+        rotationUsed = 0
+        settingsPrefs.edit()
+            .putString("simMode", mode)
+            .putInt("simRotationSlot", 0)
+            .putInt("simRotationIndex", 0)
+            .putInt("simRotationUsed", 0)
+            .apply()
+        simRefresh++
+        if (mode != "system" && !phoneStateGranted) {
+            phoneStatePermissionLauncher.launch(Manifest.permission.READ_PHONE_STATE)
+        }
+    }
+    fun openAppPermissionSettings() {
+        try {
+            context.startActivity(
+                Intent(AndroidSettings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))
+            )
+        } catch (_: Exception) {
+            message = "无法打开系统应用设置，请从系统设置的应用管理中调整权限。"
+        }
+    }
+
+    BackHandler(enabled = page != Page.HOME) {
+        page = if (page in settingsSubPages) Page.SETTINGS else Page.HOME
+    }
+
     Scaffold(
         topBar = {
             Surface(shadowElevation = 1.dp, color = Color.White) {
@@ -484,8 +517,8 @@ private fun NovaApp(
                 ) {
                     Row(Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.statusBars).padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                         if (page != Page.HOME) {
-                            IconButton(onClick = { page = Page.HOME }) {
-                                Icon(Icons.Filled.ArrowBack, contentDescription = "返回首页")
+                            IconButton(onClick = { page = if (page in settingsSubPages) Page.SETTINGS else Page.HOME }) {
+                                Icon(Icons.Filled.ArrowBack, contentDescription = "返回")
                             }
                         }
                         Surface(shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)) {
@@ -495,6 +528,9 @@ private fun NovaApp(
                                         Page.HOME -> Icons.Filled.Home
                                         Page.CUSTOMERS, Page.TAGS -> Icons.Filled.People
                                         Page.ABOUT -> Icons.Filled.Info
+                                        Page.DIAL_PREFS -> Icons.Filled.Call
+                                        Page.APPEARANCE -> Icons.Filled.Palette
+                                        Page.PERMISSIONS -> Icons.Filled.Lock
                                         Page.DIALER -> Icons.Filled.Call
                                         Page.STATS -> Icons.Filled.BarChart
                                         Page.SETTINGS -> Icons.Filled.Settings
@@ -505,8 +541,8 @@ private fun NovaApp(
                             }
                         }
                         Column(Modifier.weight(1f).padding(start = 12.dp)) {
-                            Text(when(page) { Page.HOME -> "沟通无限"; Page.CUSTOMERS -> "客户管理"; Page.DIALER -> "连续拨号"; Page.SETTINGS -> "设置"; Page.STATS -> "统计报表"; Page.TAGS -> "标签管理"; Page.ABOUT -> "关于" }, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                            Text(when(page) { Page.HOME -> "高效沟通 · 客户无限"; Page.CUSTOMERS -> "搜索 · 分类 · 批量管理"; Page.DIALER -> "拨打后记录结果，继续下一位"; Page.SETTINGS -> "双卡拨号、权限与数据管理"; Page.STATS -> "当天与当月跟进情况"; Page.TAGS -> "按业务需要定义客户分类"; Page.ABOUT -> "应用信息与免责声明" }, style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                            Text(when(page) { Page.HOME -> "沟通无限"; Page.CUSTOMERS -> "客户管理"; Page.DIALER -> "连续拨号"; Page.SETTINGS -> "设置"; Page.STATS -> "统计报表"; Page.TAGS -> "标签管理"; Page.ABOUT -> "关于"; Page.DIAL_PREFS -> "拨号偏好"; Page.APPEARANCE -> "外观设置"; Page.PERMISSIONS -> "系统权限" }, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                            Text(when(page) { Page.HOME -> "高效沟通 · 客户无限"; Page.CUSTOMERS -> "搜索 · 分类 · 批量管理"; Page.DIALER -> "拨打后记录结果，继续下一位"; Page.SETTINGS -> "双卡拨号、权限与数据管理"; Page.STATS -> "当天与当月跟进情况"; Page.TAGS -> "按业务需要定义客户分类"; Page.ABOUT -> "应用信息与免责声明"; Page.DIAL_PREFS -> "选择拨号线路与轮换规则"; Page.APPEARANCE -> "字体大小与主题颜色"; Page.PERMISSIONS -> "拨号、SIM 与通话记录权限" }, style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
                         }
                     }
                 }
@@ -526,7 +562,7 @@ private fun NovaApp(
                 NavigationBarItem(selected = page == Page.CUSTOMERS, onClick = { page = Page.CUSTOMERS }, colors = navItemColors, icon = { Icon(Icons.Filled.People, contentDescription = "客户") }, label = { Text("客户") })
                 NavigationBarItem(selected = page == Page.DIALER, onClick = { page = Page.DIALER }, colors = navItemColors, icon = { Icon(Icons.Filled.Call, contentDescription = "拨号") }, label = { Text("拨号") })
                 NavigationBarItem(selected = page == Page.STATS, onClick = { page = Page.STATS }, colors = navItemColors, icon = { Icon(Icons.Filled.BarChart, contentDescription = "统计") }, label = { Text("统计") })
-                NavigationBarItem(selected = page == Page.SETTINGS || page == Page.TAGS || page == Page.ABOUT, onClick = { page = Page.SETTINGS }, colors = navItemColors, icon = { Icon(Icons.Filled.Settings, contentDescription = "设置") }, label = { Text("设置") })
+                NavigationBarItem(selected = page == Page.SETTINGS || page in settingsSubPages, onClick = { page = Page.SETTINGS }, colors = navItemColors, icon = { Icon(Icons.Filled.Settings, contentDescription = "设置") }, label = { Text("设置") })
             }
         },
         floatingActionButton = { if (page == Page.CUSTOMERS) FloatingActionButton(onClick = { editing = null; showEditor = true }, containerColor = MaterialTheme.colorScheme.primary, contentColor = Color.White) { Icon(Icons.Filled.Add, contentDescription = "新增客户") } }
@@ -787,56 +823,36 @@ private fun NovaApp(
                     Text("系统拨出次数和时长来自 Android 通话记录；接通以系统记录的通话时长大于 0 估算。客户沟通状态统计仍来自应用内记录。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF737D8B))
                 }
             }
-            Page.SETTINGS -> {
-                fun applySimMode(mode: String) {
-                    simMode = mode
-                    rotationSlot = 0
-                    rotationUsed = 0
-                    settingsPrefs.edit()
-                        .putString("simMode", mode)
-                        .putInt("simRotationSlot", 0)
-                        .putInt("simRotationIndex", 0)
-                        .putInt("simRotationUsed", 0)
-                        .apply()
-                    simRefresh++
-                    if (mode != "system" && !phoneStateGranted) {
-                        phoneStatePermissionLauncher.launch(Manifest.permission.READ_PHONE_STATE)
-                    }
-                }
-                fun openAppPermissionSettings() {
-                    try {
-                        context.startActivity(
-                            Intent(AndroidSettings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))
-                        )
-                    } catch (_: Exception) {
-                        message = "无法打开系统应用设置，请从系统设置的应用管理中调整权限。"
-                    }
-                }
-
-                LazyColumn(
-                    Modifier.fillMaxSize().padding(insets),
-                    contentPadding = PaddingValues(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(14.dp)
-                ) {
+            Page.SETTINGS -> LazyColumn(
+                Modifier.fillMaxSize().padding(insets),
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                item { SettingsLink("拨号偏好", "双卡直拨、系统默认与按拨号轮换", Icons.Filled.Call) { page = Page.DIAL_PREFS } }
+                item { SettingsLink("外观设置", "字体大小与主题颜色", Icons.Filled.Palette) { page = Page.APPEARANCE } }
+                item { SettingsLink("系统权限", "拨号、SIM 与通话记录权限", Icons.Filled.Lock) { page = Page.PERMISSIONS } }
+                item { SettingsLink("客户标签", "创建、编辑标签及颜色", Icons.Filled.People) { page = Page.TAGS } }
+                item { SettingsLink("沟通统计", "当天与当月拨出记录和跟进情况", Icons.Filled.BarChart) { page = Page.STATS } }
+                item { SettingsLink("关于", "版本信息与免责声明", Icons.Filled.Info) { page = Page.ABOUT } }
                     item {
-                        Card(
-                            shape = RoundedCornerShape(24.dp),
-                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.09f))
-                        ) {
+                        Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
                             Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.primary) {
-                                    Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
-                                        Icon(Icons.Filled.Call, contentDescription = null, tint = Color.White)
-                                    }
+                                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text("本机客户数据", fontWeight = FontWeight.Bold)
+                                    Text("当前客户数量：${customers.size}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
+                                    Text("数据保存在本机，请定期从客户管理页导出备份。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
                                 }
-                                Column(Modifier.weight(1f).padding(start = 14.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                                    Text("拨号偏好", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                                    Text("选择线路后，点“一键拨打”立即呼叫当前客户。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF5F6C7E))
-                                }
+                                Text("${customers.size}", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
                             }
                         }
                     }
-
+            }
+            Page.DIAL_PREFS -> LazyColumn(
+                Modifier.fillMaxSize().padding(insets),
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                item { Text("选择线路后，点“一键拨打”立即呼叫当前客户。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF5F6C7E)) }
                     item {
                         Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
                             Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(13.dp)) {
@@ -881,7 +897,6 @@ private fun NovaApp(
                             }
                         }
                     }
-
                     if (simMode == "rotate") {
                         item {
                             Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F9FC))) {
@@ -919,10 +934,12 @@ private fun NovaApp(
                             }
                         }
                     }
-
-                    item {
-                        Text("外观设置", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                    }
+            }
+            Page.APPEARANCE -> LazyColumn(
+                Modifier.fillMaxSize().padding(insets),
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
                     item {
                         Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
                             Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -951,36 +968,13 @@ private fun NovaApp(
                             }
                         }
                     }
-
-                    item {
-                        Text("快捷入口", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                    }
-                    item {
-                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                            SettingsLink("客户标签", "创建、编辑标签及颜色", Icons.Filled.People) { page = Page.TAGS }
-                            SettingsLink("沟通统计", "当天与当月拨出记录和跟进情况", Icons.Filled.BarChart) { page = Page.STATS }
-                            SettingsLink("关于", "版本信息与使用说明", Icons.Filled.Info) { page = Page.ABOUT }
-                        }
-                    }
-
-                    item {
-                        Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
-                            Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Text("本机客户数据", fontWeight = FontWeight.Bold)
-                                    Text("当前客户数量：${customers.size}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
-                                    Text("数据保存在本机，请定期从客户管理页导出备份。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
-                                }
-                                Text("${customers.size}", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                            }
-                        }
-                    }
-
-                    item {
-                        Spacer(Modifier.height(4.dp))
-                        Text("系统权限", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                        Text("以下为应用会调用的 Android 权限。只有前两项是 SIM 一键直拨的必需权限。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B))
-                    }
+            }
+            Page.PERMISSIONS -> LazyColumn(
+                Modifier.fillMaxSize().padding(insets),
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                item { Text("以下为应用会调用的 Android 权限。只有前两项是 SIM 一键直拨的必需权限。", style = MaterialTheme.typography.bodySmall, color = Color(0xFF64748B)) }
                     item {
                         Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
                             Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -1033,7 +1027,6 @@ private fun NovaApp(
                             }
                         }
                     }
-                }
             }
 
             Page.TAGS -> Column(Modifier.fillMaxSize().padding(insets).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -1050,16 +1043,19 @@ private fun NovaApp(
                     } } }
                 }
             }
-            Page.ABOUT -> Column(
-                Modifier.fillMaxSize().padding(insets).padding(20.dp),
+            Page.ABOUT -> {
+            val versionName = remember { try { context.packageManager.getPackageInfo(context.packageName, 0).versionName.orEmpty() } catch (_: Exception) { "" } }
+            Column(
+                Modifier.fillMaxSize().padding(insets).verticalScroll(rememberScrollState()).padding(20.dp),
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 Text("沟通无限", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-                Text("版本 0.11.0", color = Color(0xFF64748B))
+                Text(if (versionName.isBlank()) "版本信息不可用" else "版本 $versionName", color = Color(0xFF64748B))
                 Text("用于管理本机客户名单、拨打电话、记录沟通情况和安排回访。客户资料保存在当前设备中。")
                 HorizontalDivider()
                 Text("免责声明", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 Text("本应用仅提供客户资料整理与电话拨号辅助功能。请确保你有权使用导入的客户信息，并遵守适用的隐私保护、个人信息及通信相关法律法规。拨号前请核对联系人和号码；实际通话及资费由运营商提供的通信服务决定。开发者不对因用户导入的数据、拨号操作或第三方通信服务产生的损失承担责任。")
+            }
             }
         }
     }
@@ -1803,27 +1799,20 @@ private fun rowsToCustomers(rows: List<List<String>>): List<Customer> {
             if (s.isBlank()) continue
             val digitsOnly = s.filter(Char::isDigit)
             if (digitsOnly.length in 7..15 && s.none { it.isLetter() }) {
-                val normalized = (if (s.startsWith("+")) "+" else "") + digitsOnly
-                if (!isMainlandLandlineNumber(normalized)) result.add(normalized)
+                normalizeImportedNumber(s)?.let { result.add(it) }
                 continue
             }
             // 有“电话：”等文字或括号、短横线时，提取其中的号码。
             val beforeCount = result.size
             Regex("(?<!\\d)\\+?\\d[\\d()\\-]{5,}\\d(?!\\d)").findAll(s).forEach { match ->
                 val d = match.value.filter(Char::isDigit)
-                if (d.length in 7..15) {
-                    val normalized = (if (match.value.startsWith("+")) "+" else "") + d
-                    if (!isMainlandLandlineNumber(normalized)) result.add(normalized)
-                }
+                if (d.length in 7..15) normalizeImportedNumber(match.value)?.let { result.add(it) }
             }
             // 有些表格用空格隔开多个完整号码。
             if (result.size == beforeCount) {
                 s.split(Regex("\\s+")).forEach { token ->
                     val d = token.filter(Char::isDigit)
-                    if (d.length in 7..15) {
-                        val normalized = (if (token.startsWith("+")) "+" else "") + d
-                        if (!isMainlandLandlineNumber(normalized)) result.add(normalized)
-                    }
+                    if (d.length in 7..15) normalizeImportedNumber(token)?.let { result.add(it) }
                 }
             }
         }

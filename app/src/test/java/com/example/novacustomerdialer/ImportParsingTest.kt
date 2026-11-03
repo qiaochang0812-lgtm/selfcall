@@ -48,6 +48,31 @@ class ImportParsingTest {
     }
 
     @Test
+    fun keepsMobileWithLongDistancePrefixAndDropsExtensions() {
+        assertEquals(false, isMainlandLandlineNumber("013800138000"))
+        assertEquals(false, isMainlandLandlineNumber("+8613800138000"))
+        assertEquals(false, isMainlandLandlineNumber("00447911123456"))
+        assertEquals(true, isMainlandLandlineNumber("0755-1234567"))
+        assertEquals(true, isMainlandLandlineNumber("010-12345678-801"))
+    }
+
+    @Test
+    fun dropsServiceNumbers() {
+        assertEquals(true, isMainlandLandlineNumber("4001234567"))
+        assertEquals(true, isMainlandLandlineNumber("400-123-4567"))
+        assertEquals(true, isMainlandLandlineNumber("800-123-4567"))
+    }
+
+    @Test
+    fun normalizesImportedNumbers() {
+        skippedLandlineCount = 0
+        assertEquals("13800138000", normalizeImportedNumber("013800138000"))
+        assertEquals("+8613900000000", normalizeImportedNumber("+86 139 0000 0000"))
+        assertEquals(null, normalizeImportedNumber("010-12345678"))
+        assertEquals(1, skippedLandlineCount)
+    }
+
+    @Test
     fun expandsScientificNumbers() {
         assertEquals("13800138000", plainNumber("1.3800138E10"))
         assertEquals("13800138000", plainNumber("13800138000"))

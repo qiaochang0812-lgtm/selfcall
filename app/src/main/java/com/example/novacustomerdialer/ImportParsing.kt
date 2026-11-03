@@ -242,14 +242,43 @@ internal fun readXlsxSheets(context: Context, uri: Uri): List<List<List<String>>
 }
 
 
-/** 识别中国大陆常见固定电话格式；国际号码及 11 位手机号不按长度误删。 */
+/** 本次导入中被剔除的固话/服务号数量（导入开始前由调用方清零）。 */
+internal var skippedLandlineCount = 0
+
+private val mobileDigitsRegex = Regex("^1[3-9]\\d{9}$")
+private val chinaCodeLandlineRegex = Regex("^(10|2[0-9]|[3-9]\\d{2})\\d{7,8}$")
+
+/**
+ * 判断是否为需要剔除的号码：大陆固话（含区号、本地 7~8 位、带分机）和 400/800 服务号。
+ * 11 位手机号、带长途前缀 0 的手机号、以 00 开头或带 + 的国际号码都不会被剔除。
+ */
 internal fun isMainlandLandlineNumber(raw: String): Boolean {
-    var digits = raw.filter { it.isDigit() }
-    if (digits.startsWith("0086")) digits = digits.removePrefix("0086")
-    else if (digits.startsWith("86") && digits.length >= 11) digits = digits.removePrefix("86")
+    val trimmed = raw.trim()
+    var digits = trimmed.filter { it.isDigit() }
+    if (digits.startsWith("0086")) digits = digits.substring(4)
+    else if (digits.startsWith("86") && digits.length >= 11) digits = digits.substring(2)
+    // 00 开头是国际长途前缀，不是区号。
+    if (digits.startsWith("00")) return false
+    // 0 开头：长途前缀 + 手机号仍是手机号；其余按区号固话处理（含分机，长度不限）。
+    if (digits.startsWith("0")) return !mobileDigitsRegex.matches(digits.substring(1))
     if (digits.length in 7..8) return true
-    if (digits.length in 10..12 && digits.startsWith("0")) return true
+    if (digits.length == 10 && (digits.startsWith("400") || digits.startsWith("800"))) return true
     // 国际写法 +86 21 12345678：仅在明确带中国国家码时按区号识别。
-    val hasChinaCountryCode = raw.trim().startsWith("+86") || raw.trim().startsWith("0086")
-    return hasChinaCountryCode && digits.matches(Regex("^(10|2[0-9]|[3-9]\\d{2})\\d{7,8}$"))
+    val hasChinaCountryCode = trimmed.startsWith("+86") || trimmed.startsWith("0086")
+    return hasChinaCountryCode && chinaCodeLandlineRegex.matches(digits)
+}
+
+/** 导入号码的规范化：剔除固话/服务号返回 null；0+手机号去掉多余的 0；保留开头的 +。 */
+internal fun normalizeImportedNumber(raw: String): String? {
+    val s = raw.trim()
+    val digits = s.filter { it.isDigit() }
+    if (digits.length !in 7..15) return null
+    if (isMainlandLandlineNumber(s)) {
+        skippedLandlineCount++
+        return null
+    }
+    if (!s.startsWith("+") && digits.startsWith("0") && !digits.startsWith("00") && mobileDigitsRegex.matches(digits.substring(1))) {
+        return digits.substring(1)
+    }
+    return (if (s.startsWith("+")) "+" else "") + digits
 }
